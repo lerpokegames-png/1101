@@ -2017,8 +2017,22 @@ def buscar_manchetes(termo, limite=None):
         print(f"    (pesquisa: Google News não respondeu - {type(erro).__name__})")
         return []
 
+    # O feedparser NÃO levanta exceção quando a rede falha: devolve um feed
+    # vazio com bozo=1 e segue em silêncio. Sem este aviso, ficar sem
+    # manchete nenhuma parece "o tema não tem notícia" quando na verdade foi
+    # a internet - confundiu o diagnóstico num teste real.
+    entradas = getattr(feed, "entries", [])
+    if not entradas:
+        motivo = getattr(feed, "bozo_exception", None) or getattr(feed, "status", "")
+        print(
+            "    (pesquisa: Google News não devolveu manchete"
+            + (f" - {type(motivo).__name__ if isinstance(motivo, Exception) else motivo}" if motivo else "")
+            + ")"
+        )
+        return []
+
     manchetes = []
-    for entrada in getattr(feed, "entries", [])[:limite]:
+    for entrada in entradas[:limite]:
         titulo = getattr(entrada, "title", "").strip()
         if not titulo:
             continue
@@ -2505,9 +2519,19 @@ def extrair_mudancas_obrigatorias(avaliacao_texto):
     quatro tentativas assim estouravam o contexto do modelo e derrubavam
     a execução com 'context_length_exceeded'.
     """
+    # Para no PRÓXIMO campo do template, seja ele qual for. Parar só no
+    # VEREDITO funcionava enquanto o modelo mantinha a ordem do template -
+    # quando ele troca a ordem, o campo seguinte inteiro vinha junto e
+    # virava "mudança obrigatória" que o roteirista não sabe executar.
+    proximo_campo = "|".join(
+        _padrao_rotulo(campo)
+        for campo in _CAMPOS_PROBLEMA_APRENDIZADO
+        + ("VEREDITO", "CHANCE DE RETENÇÃO", "NOTA DO GANCHO",
+           "PONTOS DE QUEDA", "FECHO", "MOTIVO")
+    )
     match = re.search(
         _padrao_rotulo("MUDANÇAS OBRIGATÓRIAS")
-        + r"(.+?)(?:\n[*_#>\s]*VEREDITO[*_#\s]*:|\Z)",
+        + r"(.+?)(?:\n(?:" + proximo_campo + r")|\Z)",
         avaliacao_texto,
         re.DOTALL,
     )
@@ -2517,6 +2541,33 @@ def extrair_mudancas_obrigatorias(avaliacao_texto):
     # CORTADA - devolver o texto inteiro aqui era o começo da bola de neve
     # que estourava o contexto depois de 3-4 tentativas.
     return _truncar(avaliacao_texto, 3000, "avaliação (template não seguido)")
+
+
+def avaliacao_segue_template(avaliacao_texto):
+    """
+    O crítico devolveu uma avaliação de verdade, ou devolveu outra coisa?
+
+    Modelo pequeno às vezes ignora o template e responde qualquer coisa -
+    num ensaio do pipeline ele devolveu um ROTEIRO no lugar da avaliação.
+    Sem esta checagem, o texto inteiro virava "mudanças obrigatórias"
+    (pelo fallback de extrair_mudancas_obrigatorias) e ia parar no prompt
+    do roteirista, que passava a tentar "corrigir" um pedido que não era
+    pedido nenhum - e o loop reprovava de novo, sempre igual.
+
+    Dois sinais bastam: a linha do veredito e pelo menos dois nomes de
+    campo do template.
+    """
+    if not avaliacao_texto or len(avaliacao_texto.strip()) < 40:
+        return False
+    tem_veredito = bool(re.search(
+        _padrao_rotulo("VEREDITO") + r"(APROVADO|REPROVADO)",
+        avaliacao_texto, re.IGNORECASE,
+    ))
+    campos_achados = sum(
+        1 for campo in _CAMPOS_PROBLEMA_APRENDIZADO + ("MUDANÇAS OBRIGATÓRIAS", "CHANCE DE RETENÇÃO")
+        if re.search(_padrao_rotulo(campo), avaliacao_texto)
+    )
+    return tem_veredito and campos_achados >= 2
 
 
 def extrair_veredito(avaliacao_texto):
@@ -2768,7 +2819,9 @@ def _padrao_rotulo(nome):
             partes.append(f"[{caractere}{base}]")
         else:
             partes.append(re.escape(caractere))
-    return r"[*_#>\s]*" + "".join(partes) + r"[*_#\s]*:[ \t]*[*_#]*"
+    # O rabicho aceita as duas ordens que aparecem na prática:
+    # "**CAMPO:** valor" (markdown, espaço) e "CAMPO: **valor**".
+    return r"[*_#>\s]*" + "".join(partes) + r"[*_#\s]*:[ \t]*[*_#]*[ \t]*"
 
 
 # Marcas de SUGESTÃO: se o item começa assim, o próprio crítico está
@@ -3511,6 +3564,35 @@ def gerar_video_completo(tema, max_tentativas=4, pesquisar=None):
 
         print("  Avaliando roteiro...")
         avaliacao = avaliar_roteiro(roteiro, mudancas_pedidas_antes=mudancas, dossie=dossie)
+
+        # Avaliação fora do template não é reprovação - é resposta perdida.
+        # Tenta uma vez mais; se vier torta de novo, ignora a rodada em vez
+        # de mandar o texto solto de volta pro roteirista como se fosse
+        # uma lista de correções.
+        if not avaliacao_segue_template(avaliacao):
+            print("    Aviso: o crítico respondeu fora do template - repetindo a avaliação.")
+            avaliacao = avaliar_roteiro(roteiro, mudancas_pedidas_antes=mudancas, dossie=dossie)
+        if not avaliacao_segue_template(avaliacao):
+            print(
+                "    Aviso: crítico respondeu fora do template duas vezes - "
+                "esta rodada não conta como reprovação (nada foi enviado de "
+                "volta pro roteirista)."
+            )
+            historico.append({
+                "tentativa": tentativa,
+                "veredito": "avaliação inválida",
+                "mudancas_pedidas": "",
+                "sugestoes_nao_bloqueantes": [],
+            })
+            if melhor is None:
+                melhor = {
+                    "qualidade": _qualidade_da_tentativa("reprovado", "", roteiro),
+                    "roteiro": roteiro, "avaliacao": avaliacao,
+                    "mudancas": "", "tentativa": tentativa,
+                }
+            mudancas = None
+            continue
+
         veredito = extrair_veredito(avaliacao)
         mudancas_brutas = extrair_mudancas_obrigatorias(avaliacao)
         registrar_aprendizado(avaliacao)
@@ -3612,9 +3694,17 @@ def gerar_video_completo(tema, max_tentativas=4, pesquisar=None):
     else:
         pendencias_manuais = ""
 
-    # Rede de segurança final: se mesmo assim o roteiro escolhido está
-    # curto (ex: a melhor versão veio de uma tentativa anterior), expande.
-    roteiro = aplicar_expansao(roteiro, tema)
+    # Aqui NÃO roda expansão de novo: todo roteiro que chega neste ponto
+    # já passou por aplicar_expansao() na sua própria tentativa. Chamar
+    # outra vez só repetiria a mesma expansão que já tinha sido
+    # descartada - um a dois minutos de GPU por vídeo, sem nada em troca.
+    palavras_finais = contar_palavras_narracao(roteiro)
+    if palavras_finais < MINIMO_PALAVRAS_PRA_AVALIAR:
+        print(
+            f"  Aviso: o roteiro final tem ~{palavras_finais} palavras de "
+            f"narração (o alvo é 1270-1620). A expansão já foi tentada e não "
+            "melhorou - desenvolva mais algum bloco na mão ou gere de novo."
+        )
 
     if GERAR_EM_INGLES:
         print("Traduzindo roteiro (inglês -> português falado natural)...")
