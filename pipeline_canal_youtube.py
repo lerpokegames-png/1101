@@ -3,7 +3,10 @@ Pipeline de criação de roteiros para YouTube - nicho empresas/administração
 ============================================================================
 
 4 AGENTES:
-1. Pesquisador  -> busca assuntos em alta (Google News RSS, sem chave de API)
+1. Pesquisador  -> busca assuntos em alta (Google News RSS, sem chave de API).
+    DESLIGADO por padrão: manchete de jornal quase nunca vira tema bom aqui
+    (vem com nome do veículo colado, é notícia do dia, não evergreen). Pra
+    voltar a ver esses temas na lista, mude USAR_TEMAS_DE_NOTICIA pra True.
 1B. Referência  -> busca os vídeos mais vistos de canais de referência do
     nicho (Elementar, Primo Rico, Nerds de Negócios) via API do YouTube, e
     gera temas novos inspirados no padrão deles
@@ -183,6 +186,14 @@ CAMINHO_CACHE_DICIONARIO = PASTA_DO_SCRIPT / ".pronuncia_dict_cache.json"
 # - NerdsdeNegocios: Peter Jordan, maior canal de empreendedorismo do Brasil
 # Use o handle exatamente como aparece na URL do canal (youtube.com/@handle).
 CANAIS_REFERENCIA = ["Elementar", "primorico", "NerdsdeNegocios"]
+
+# Manchete de Google News quase nunca vira tema bom aqui: vem com nome de
+# jornal colado no fim, é notícia do dia (não evergreen) e concorre com os
+# temas gerados a partir dos canais de referência, que é o que você acaba
+# escolhendo na prática. Por isso o pipeline não busca mais notícia por
+# padrão - a função pesquisar_temas_em_alta() continua no código e volta
+# à lista de candidatos se você mudar isto pra True.
+USAR_TEMAS_DE_NOTICIA = False
 
 
 # =========================================================================
@@ -1759,7 +1770,7 @@ def _salvar_narracao_pendente(blocos_pendentes, caminho_saida_mp3):
     return caminho, len(texto)
 
 
-def gerar_audio_elevenlabs(texto_narracao_limpo, caminho_saida_mp3):
+def gerar_audio_elevenlabs(texto_narracao_limpo, caminho_saida_mp3, pedir_confirmacao=True):
     """
     Gera o arquivo de áudio final via ElevenLabs. Retorna o caminho salvo
     (mesmo que parcial), ou None se pulou (sem chave configurada) ou não
@@ -1786,6 +1797,12 @@ def gerar_audio_elevenlabs(texto_narracao_limpo, caminho_saida_mp3):
     blocos = dividir_em_blocos_narracao(texto_preparado)
     custo_total = sum(len(bloco) for bloco in blocos)
 
+    # A consulta de cota serve pra AVISAR, não pra decidir sozinha onde
+    # parar: no log real, 6.419 caracteres custaram 3.094 créditos (menos
+    # da metade), ou seja, contar 1 crédito por caractere superestima o
+    # custo e deixaria crédito sobrando sem uso. Quem decide o que ainda
+    # cabe é a própria API - o loop abaixo tenta todos os blocos e para no
+    # primeiro que for recusado por cota, salvando o que já saiu.
     creditos_restantes = None
     cota = consultar_cota_elevenlabs()
     if cota:
@@ -1793,19 +1810,41 @@ def gerar_audio_elevenlabs(texto_narracao_limpo, caminho_saida_mp3):
         creditos_restantes = max(limite - usados, 0)
         print(
             f"    Cota ElevenLabs: {creditos_restantes} crédito(s) de "
-            f"{limite} ainda disponíveis; esta narração custa ~{custo_total}."
+            f"{limite} ainda disponíveis; esta narração tem {custo_total} "
+            "caracteres (o custo real costuma ser menor que isso)."
         )
         if custo_total > creditos_restantes:
             print(
-                "    Atenção: a cota não cobre a narração inteira - vou gerar "
-                "só o que couber e salvar o restante do texto num .txt pra "
-                "você terminar quando a cota renovar."
+                "    Atenção: a cota pode não cobrir a narração inteira - o "
+                "que couber vira áudio e o resto fica num .txt pra você "
+                "terminar quando a cota renovar."
             )
     else:
         print(
             "    (não consegui consultar a cota do ElevenLabs - seguindo "
             "e tentando gerar normalmente)"
         )
+
+    # O áudio é a ÚNICA etapa paga do pipeline. Sem esta pergunta, cada
+    # execução de teste queima crédito de um roteiro que talvez você nem
+    # vá usar - e crédito que acabou só volta quando o ciclo renova.
+    if pedir_confirmacao:
+        try:
+            resposta = input(
+                "    Gerar o áudio agora e gastar crédito? "
+                "(Enter = sim | n = pular e gerar depois): "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            resposta = ""
+        if resposta.startswith("n"):
+            caminho_pendente, total = _salvar_narracao_pendente(
+                blocos, caminho_saida_mp3
+            )
+            print(
+                f"    Áudio pulado - nenhum crédito gasto. A narração inteira "
+                f"({total} caracteres) está em: {caminho_pendente}"
+            )
+            return None
 
     dicionario = garantir_dicionario_pronuncia()
 
@@ -1818,14 +1857,6 @@ def gerar_audio_elevenlabs(texto_narracao_limpo, caminho_saida_mp3):
     indice_parada = None  # primeiro bloco que NÃO entrou no áudio
 
     for i, bloco in enumerate(blocos, 1):
-        if creditos_restantes is not None and gasto + len(bloco) > creditos_restantes:
-            print(
-                f"    Cota esgotada antes do bloco {i}/{len(blocos)} - "
-                "parando aqui e guardando o resto do texto."
-            )
-            indice_parada = i - 1
-            break
-
         print(f"    Gerando áudio - bloco {i}/{len(blocos)} ({len(bloco)} caracteres)...")
 
         corpo = {
@@ -1893,7 +1924,7 @@ def gerar_audio_elevenlabs(texto_narracao_limpo, caminho_saida_mp3):
             break
 
         audio_completo += resp.content
-        gasto += len(bloco)
+        gasto += len(bloco)  # só pra relatório, não decide mais nada
     else:
         indice_parada = len(blocos)
 
@@ -2043,13 +2074,16 @@ if __name__ == "__main__":
             carimbo = caminho_escolhido.stem.replace("video_", "")
 
     if resultado is None:
-        print("Buscando temas em alta (notícia)...")
-        temas_noticia = pesquisar_temas_em_alta()
-        print("Temas de notícia encontrados:")
-        for t in temas_noticia:
-            print(" -", t)
+        if USAR_TEMAS_DE_NOTICIA:
+            print("Buscando temas em alta (notícia)...")
+            temas_noticia = pesquisar_temas_em_alta()
+            print("Temas de notícia encontrados:")
+            for t in temas_noticia:
+                print(" -", t)
+        else:
+            temas_noticia = []
 
-        print("\nBuscando vídeos de maior sucesso dos canais de referência...")
+        print("Buscando vídeos de maior sucesso dos canais de referência...")
         titulos_referencia = buscar_referencias()
         if titulos_referencia:
             print(f"  {len(titulos_referencia)} títulos de referência encontrados.")
@@ -2063,10 +2097,15 @@ if __name__ == "__main__":
                   "pulando o agente de referência.")
             temas_inspirados = []
 
-        # Junta as duas fontes - notícia traz atualidade, referência traz
-        # temas evergreen com padrão comprovado de sucesso
+        # Referência primeiro (padrão comprovado de sucesso no nicho);
+        # notícia só entra se USAR_TEMAS_DE_NOTICIA estiver ligado
         todos_temas = temas_inspirados + temas_noticia
         if not todos_temas:
+            print(
+                "\nNenhum tema automático disponível - digite o seu tema na "
+                "pergunta abaixo (ou configure a YOUTUBE_API_KEY no .env pra "
+                "voltar a receber sugestões dos canais de referência)."
+            )
             todos_temas = ["Como a BYD ficou tão grande"]
 
         print("\nTodos os temas candidatos:")
