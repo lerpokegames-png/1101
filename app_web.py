@@ -295,14 +295,50 @@ with aba_novo:
                         )
 
         with col_broll:
-            st.markdown("**🎞️ Clipes de b-roll (Pexels - grátis)**")
-            if st.button("Baixar clipes agora"):
-                with st.spinner("Baixando clipes..."):
-                    pasta_broll = PASTA_SAIDAS / f"video_{carimbo}_broll"
-                    baixados, pulados = pipe.baixar_broll(
-                        resultado["broll"], pasta_broll
-                    )
-                st.success(f"{len(baixados)} clipe(s) baixado(s) em: {pasta_broll}")
+            st.markdown("**🎞️ B-roll (Pexels grátis + ilustrações geradas)**")
+            plano = resultado.get("broll") or []
+            if isinstance(plano, dict):
+                plano = pipe._plano_a_partir_de_dict_antigo(plano)
+            por_fonte = {}
+            for seg in plano:
+                por_fonte[seg["fonte"]] = por_fonte.get(seg["fonte"], 0) + 1
+            if por_fonte:
+                st.caption(
+                    "Plano: "
+                    + ", ".join(f"{qtd} {nome}" for nome, qtd in sorted(por_fonte.items()))
+                )
+            gerar_ilustracoes = st.checkbox(
+                "Gerar as ilustrações dos trechos específicos",
+                value=pipe.USAR_BROLL_IA and por_fonte.get("ia", 0) > 0,
+                help=(
+                    "Usa o gerador configurado em PROVEDOR_IMAGEM (o padrão é "
+                    "gratuito e sem chave). Trecho que falhar volta pro Pexels "
+                    "automaticamente. As imagens saem maiores que o frame final, "
+                    "pra você ter espaço de zoom no Ken Burns na edição."
+                ),
+            )
+            if st.button("Preparar b-roll agora"):
+                pasta_broll = PASTA_SAIDAS / f"video_{carimbo}_broll"
+                if gerar_ilustracoes:
+                    with st.spinner("Gerando ilustrações..."):
+                        gerados, rebaixados = pipe.gerar_broll_ilustrado(
+                            plano, pasta_broll,
+                            tema=resultado["tema"], roteiro=resultado["roteiro"],
+                        )
+                    st.success(f"{len(gerados)} ilustração(ões) gerada(s).")
+                    if rebaixados:
+                        st.info(f"{len(rebaixados)} trecho(s) voltaram pro Pexels.")
+                with st.spinner("Baixando clipes do Pexels..."):
+                    baixados, pulados = pipe.baixar_broll(plano, pasta_broll)
+                caminho_manifest = pipe.salvar_manifest(
+                    plano, pasta_broll / "manifest.json", resultado["tema"]
+                )
+                resultado["broll"] = plano
+                salvar_json_e_txt(resultado, carimbo)
+                st.success(
+                    f"{len(baixados)} clipe(s) baixado(s) em: {pasta_broll}\n\n"
+                    f"Manifest pro CapCut: {caminho_manifest}"
+                )
                 if pulados:
                     st.warning(f"{len(pulados)} trecho(s) sem clipe - veja o .txt salvo pra detalhes.")
 

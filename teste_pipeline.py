@@ -256,13 +256,91 @@ def _avaliacao(mudancas, veredito, evento="Nenhum encontrado"):
     )
 
 
+def testar_broll_hibrido():
+    print("\n6. B-roll híbrido (Pexels + ilustração)")
+    roteiro = (
+        "NARRAÇÃO: Um panorama do setor inteiro naquele ano difícil.\n"
+        "VISUAL: b-roll genérico de cidade ao amanhecer\n"
+        "NARRAÇÃO: Outro momento da história, com a mesma imagem de apoio.\n"
+        "VISUAL: b-roll genérico de cidade ao amanhecer\n"
+        "NARRAÇÃO: O dono confere a planilha de despesas sozinho de madrugada.\n"
+        "VISUAL: [ARQUIVO REAL] o dono olhando as contas no balcão\n"
+        "NARRAÇÃO: E o faturamento despencou no trimestre seguinte.\n"
+        "VISUAL: b-roll genérico de gráfico caindo na tela"
+    )
+    segmentos = pipe.parear_narracao_e_visual(roteiro)
+    checar("um segmento por trecho, mesmo com VISUAL repetido",
+           len(segmentos) == 4, f"{len(segmentos)} segmentos")
+    checar("cada segmento leva a própria narração",
+           all(s["narracao"] for s in segmentos))
+    checar("cena genérica vai pro Pexels",
+           pipe.classificar_fonte_do_trecho(segmentos[0]["narracao"],
+                                            segmentos[0]["visual"]) == "pexels")
+    checar("[ARQUIVO REAL] vira ilustração",
+           pipe.classificar_fonte_do_trecho(segmentos[2]["narracao"],
+                                            segmentos[2]["visual"]) == "ia")
+
+    original = {"traduz": pipe.traduzir_termo_busca,
+                "busca": pipe.buscar_broll_com_alternativas,
+                "llm": pipe.chamar_llm, "requests": pipe.requests}
+    pasta = Path(tempfile.mkdtemp(prefix="broll_teste_"))
+    try:
+        pipe.traduzir_termo_busca = lambda t: "generic city sunrise"
+        pipe.buscar_broll_com_alternativas = lambda en, pt: [
+            {"id": 1, "preview": "http://exemplo/v.mp4", "duracao_s": 10}]
+        pipe.chamar_llm = lambda prompt, **k: (
+            "bald character in a mustard yellow t-shirt and blue denim apron"
+            if "recurring character" in prompt
+            else "a shop owner alone at night checking expense sheets")
+        plano = pipe.montar_plano_de_broll(roteiro)
+        checar("trecho de ilustração não gasta busca no Pexels",
+               plano[2]["resultados_pexels"] == [])
+
+        pipe.requests = types.SimpleNamespace(get=lambda url, timeout=None, **kw:
+            types.SimpleNamespace(content=b"\xff\xd8\xff" + b"0" * 2000,
+                                  raise_for_status=lambda: None,
+                                  headers={"content-type": "image/jpeg"}))
+        gerados, _ = pipe.gerar_broll_ilustrado(plano, pasta, tema="t", roteiro=roteiro)
+        checar("gera a ilustração do trecho específico", len(gerados) == 1, str(gerados))
+        prompt_final = plano[2].get("prompt_imagem", "")
+        checar("prompt junta cena + ficha de personagem + estilo fixo",
+               all(marca in prompt_final for marca in
+                   ("shop owner", "denim apron", "Minimalist webtoon-style")),
+               prompt_final[:120])
+
+        # provedor fora do ar: o trecho não pode ficar sem imagem
+        plano2 = pipe.montar_plano_de_broll(roteiro)
+        def quebrado(url, timeout=None, **kw):
+            raise ConnectionError("provedor fora do ar")
+        pipe.requests = types.SimpleNamespace(get=quebrado)
+        gerados2, rebaixados = pipe.gerar_broll_ilustrado(
+            plano2, Path(tempfile.mkdtemp()), tema="t", roteiro=roteiro)
+        checar("falha na geração devolve o trecho pro Pexels",
+               gerados2 == [] and plano2[2]["fonte"] == "pexels"
+               and plano2[2]["resultados_pexels"] != [],
+               str(plano2[2]))
+
+        manifest = pipe.montar_manifest(plano, tema="t")
+        checar("manifest tem um item por trecho, na ordem",
+               [t["ordem"] for t in manifest["trechos"]] == [1, 2, 3, 4])
+        checar("manifest separa as fontes",
+               manifest["por_fonte"] == {"ia": 1, "pexels": 3},
+               str(manifest["por_fonte"]))
+    finally:
+        pipe.traduzir_termo_busca = original["traduz"]
+        pipe.buscar_broll_com_alternativas = original["busca"]
+        pipe.chamar_llm = original["llm"]
+        pipe.requests = original["requests"]
+        shutil.rmtree(pasta, ignore_errors=True)
+
+
 def testar_fluxo_completo():
-    print("\n5. Fluxo completo do vídeo")
+    print("\n7. Fluxo completo do vídeo")
     pasta = Path(tempfile.mkdtemp(prefix="ensaio_pipeline_"))
     original = {
         "requests": pipe.requests,
         "chamar_llm": pipe.chamar_llm,
-        "broll": pipe.montar_lista_broll,
+        "plano": pipe.montar_plano_de_broll,
         "cache": pipe.PASTA_CACHE_PESQUISA,
         "parse": feedparser.parse,
         "ingles": pipe.GERAR_EM_INGLES,
@@ -304,7 +382,13 @@ def testar_fluxo_completo():
 
     pipe.requests = types.SimpleNamespace(get=get_falso)
     feedparser.parse = (lambda real: lambda url: real(RSS_FALSO))(feedparser.parse)
-    pipe.montar_lista_broll = lambda roteiro: {"esteira de encomendas parada": []}
+    def plano_falso(roteiro):
+        segmentos = pipe.parear_narracao_e_visual(roteiro)
+        for segmento in segmentos:
+            segmento.update(fonte="pexels", arquivo=None, arquivo_real=False,
+                            resultados_pexels=[])
+        return segmentos
+    pipe.montar_plano_de_broll = plano_falso
 
     rodadas = {"critico": 0}
 
@@ -380,7 +464,7 @@ def testar_fluxo_completo():
     finally:
         pipe.requests = original["requests"]
         pipe.chamar_llm = original["chamar_llm"]
-        pipe.montar_lista_broll = original["broll"]
+        pipe.montar_plano_de_broll = original["plano"]
         pipe.PASTA_CACHE_PESQUISA = original["cache"]
         feedparser.parse = original["parse"]
         pipe.GERAR_EM_INGLES = original["ingles"]
@@ -396,6 +480,7 @@ if __name__ == "__main__":
     testar_filtro()
     testar_leitura_do_critico()
     testar_escolha_do_artigo()
+    testar_broll_hibrido()
     testar_fluxo_completo()
     print("\n" + "=" * 70)
     if FALHAS:

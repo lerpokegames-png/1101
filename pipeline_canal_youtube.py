@@ -271,6 +271,45 @@ CAMINHO_ESTATISTICAS_APRENDIZADO = PASTA_DO_SCRIPT / ".estatisticas_aprendizado.
 # preenchidos (o valor "vazio" de cada um varia - por isso a checagem
 # fica em _campo_indica_problema, não aqui)
 # =========================================================================
+# B-ROLL ILUSTRADO (agente 4B) - imagem gerada por IA
+# =========================================================================
+# True = trechos específicos da história ganham ilustração gerada; False =
+# tudo vem do Pexels, como antes.
+USAR_BROLL_IA = True
+
+# "pollinations" é o padrão por ser GRATUITO e não exigir chave nenhuma.
+# "huggingface" também é gratuito, mas precisa de um token (grátis) no
+# .env e tem fila. Provedor pago com referência de imagem (Ideogram,
+# gpt-image-1, Imagen) entra aqui depois, na mesma interface - ver
+# _PROVEDORES_DE_IMAGEM.
+PROVEDOR_IMAGEM = "pollinations"
+POLLINATIONS_MODELO = "flux"
+HUGGINGFACE_MODELO_IMAGEM = "black-forest-labs/FLUX.1-schnell"
+HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "")
+
+# Teto de imagens por vídeo. Com provedor gratuito o custo é tempo e
+# limite de uso, não dinheiro - mas o teto continua valendo pra não
+# transformar um vídeo inteiro em slideshow de imagem parada.
+MAX_AI_IMAGES_PER_VIDEO = 12
+
+# Proporção máxima de trechos ilustrados. É TETO, não cota: nunca empurra
+# um trecho pra IA só pra bater a porcentagem.
+TETO_PROPORCAO_IA = 0.4
+
+# Resolução da geração. Maior que o frame final de propósito: sobra de
+# pixel é espaço de zoom no Ken Burns, que você aplica na edição. O
+# provedor pode devolver menos que isso - nenhum gerador entrega 4K hoje.
+IMAGEM_IA_LARGURA = 2048
+IMAGEM_IA_ALTURA = 1152
+IMAGEM_IA_TIMEOUT_S = 180
+
+# Usada quando o LLM não devolve uma ficha aproveitável.
+FICHA_PERSONAGEM_PADRAO = (
+    "the same recurring character in every scene: bald round head, mustard "
+    "yellow t-shirt under a blue denim apron, thin black stick arms"
+)
+
+# =========================================================================
 # PESQUISA DE FATOS (agente 0) - o que o roteirista lê antes de escrever
 # =========================================================================
 # True = antes de escrever, o pipeline levanta material real sobre o tema
@@ -3374,21 +3413,6 @@ def buscar_broll_com_alternativas(termo_en, termo_pt):
     return []
 
 
-def montar_lista_broll(roteiro):
-    termos = extrair_linhas_visuais(roteiro)
-    resultado = {}
-    for termo in termos:
-        if "[ARQUIVO REAL]" in termo.upper() or "ARQUIVO REAL" in termo.upper():
-            # isso precisa vir de imprensa/arquivo real, nunca vai achar no
-            # banco de stock - não vale a pena nem tentar buscar
-            resultado[termo] = {"tipo": "arquivo_real_necessario", "resultados": []}
-            continue
-        termo_busca_en = traduzir_termo_busca(termo)
-        print(f"    Buscando '{termo}' como '{termo_busca_en}'...")
-        resultado[termo] = buscar_broll_com_alternativas(termo_busca_en, termo)
-    return resultado
-
-
 def _slugificar(texto, tamanho_max=40):
     """Transforma o termo de busca num nome de arquivo seguro (sem acento,
     sem espaço, sem caractere especial)."""
@@ -3397,7 +3421,26 @@ def _slugificar(texto, tamanho_max=40):
     return texto[:tamanho_max] or "clipe"
 
 
-def baixar_broll(broll_dict, pasta_destino, por_termo=1):
+def _plano_a_partir_de_dict_antigo(broll_dict):
+    """Converte o formato antigo ({texto_visual: resultados}) na lista de
+    segmentos. Serve pra abrir na interface os JSON salvos antes desta
+    mudança, sem precisar regerar o vídeo."""
+    plano = []
+    for indice, (visual, dados) in enumerate(broll_dict.items(), 1):
+        arquivo_real = isinstance(dados, dict) and dados.get("tipo") == "arquivo_real_necessario"
+        plano.append({
+            "indice": indice,
+            "narracao": "",
+            "visual": visual,
+            "arquivo_real": arquivo_real,
+            "fonte": "arquivo_real" if arquivo_real else "pexels",
+            "arquivo": None,
+            "resultados_pexels": [] if arquivo_real else (dados or []),
+        })
+    return plano
+
+
+def baixar_broll(plano, pasta_destino, por_termo=1):
     """
     Baixa os clipes de b-roll encontrados pra uma pasta local, prontos pra
     arrastar direto no editor de vídeo - em vez de só listar o link, que
@@ -3408,15 +3451,28 @@ def baixar_broll(broll_dict, pasta_destino, por_termo=1):
     visualmente qual encaixa melhor antes de editar.
 
     Retorna (baixados, pulados) - duas listas pra você ver o que faltou.
+
+    Recebe a LISTA de segmentos de montar_plano_de_broll(). Aceita também
+    o dicionário do formato antigo, pra abrir vídeo salvo antes da
+    mudança.
     """
+    if isinstance(plano, dict):
+        plano = _plano_a_partir_de_dict_antigo(plano)
+
     pasta_destino.mkdir(parents=True, exist_ok=True)
     baixados = []
     pulados = []
 
-    for i, (termo, dados) in enumerate(broll_dict.items(), 1):
-        if isinstance(dados, dict) and dados.get("tipo") == "arquivo_real_necessario":
+    for segmento in plano:
+        i = segmento["indice"]
+        termo = segmento["visual"] or segmento["narracao"][:60]
+        if segmento["fonte"] == "ia":
+            # Já tem (ou vai ter) ilustração - não é caso de baixar clipe.
+            continue
+        if segmento["fonte"] == "arquivo_real":
             pulados.append((termo, "precisa de arquivo real, não é banco de stock"))
             continue
+        dados = segmento.get("resultados_pexels") or []
         if not dados:
             pulados.append((termo, "nenhum resultado encontrado na busca"))
             continue
@@ -3437,11 +3493,458 @@ def baixar_broll(broll_dict, pasta_destino, por_termo=1):
                         f.write(pedaco)
                 print(f"    Baixado: {nome_arquivo}")
                 baixados.append(nome_arquivo)
+                if j == 1:
+                    segmento["arquivo"] = nome_arquivo
             except Exception as e:
                 pulados.append((termo, f"erro ao baixar ({type(e).__name__})"))
 
     print(f"    {len(baixados)} clipe(s) baixado(s), {len(pulados)} pulado(s).")
     return baixados, pulados
+
+
+# =========================================================================
+# AGENTE 4B - B-ROLL ILUSTRADO (imagem gerada por IA)
+# =========================================================================
+# Por que existe: o Pexels cobre bem o genérico (cidade, escritório,
+# gráfico, mãos digitando) e não cobre nada do específico - "o dono da
+# loja olhando a planilha de despesas às 23h" não existe em banco de
+# stock. Hoje esses trechos são marcados [ARQUIVO REAL] pelo roteirista e
+# ficam SEM imagem nenhuma (montar_plano_de_broll pulava a busca). São
+# exatamente as cenas que a ilustração resolve.
+#
+# CONSISTÊNCIA DE PERSONAGEM SEM IMAGEM DE REFERÊNCIA: no estilo deste
+# canal o personagem não tem rosto - é um círculo com dois pontos e um
+# traço. Quem identifica o mesmo personagem entre duas cenas é a ROUPA e
+# o estilo, não a face. Então uma ficha em TEXTO, repetida em toda
+# chamada, sustenta a consistência quase tão bem quanto uma referência
+# visual - e é o que permite usar gerador gratuito, já que nenhum dos
+# gratuitos aceita imagem de referência.
+
+ESTILO_IMAGEM_IA = (
+    "Minimalist webtoon-style illustration, characters with simple "
+    "circular heads, dot eyes, thin line mouth, flat stick-figure-style "
+    "bodies wearing detailed clothing, thick black outlines, flat "
+    "cel-shaded coloring, muted desaturated color palette, subtle grainy "
+    "paper texture, highly detailed realistic background environment, "
+    "digital illustration, comic panel style"
+)
+
+# Sinais de cena GENÉRICA - o Pexels cobre bem e de graça, não faz sentido
+# gastar geração de imagem nisso.
+PALAVRAS_FORCAM_PEXELS = (
+    "b-roll genérico", "b-roll generico", "cidade", "trânsito", "transito",
+    "skyline", "prédio", "predio", "fachada", "gráfico", "grafico",
+    "tela", "monitor", "dinheiro", "cédula", "cedula", "moeda", "esteira",
+    "fábrica", "fabrica", "galpão", "galpao", "porto", "contêiner",
+    "conteiner", "caminhão", "caminhao", "estrada", "multidão", "multidao",
+    "teclado", "mãos digitando", "maos digitando", "aperto de mão",
+)
+
+# Sinais de cena ESPECÍFICA da história - é o que o banco de stock não
+# tem e a ilustração resolve.
+PALAVRAS_FORCAM_IA = (
+    "arquivo real", "personagem", "dono", "gerente", "funcionário",
+    "funcionario", "cliente", "vendedor", "atendente", "sozinho",
+    "olhando", "percebe", "descobre", "conta", "confere", "assina",
+    "discute", "reunião de diretoria", "reuniao de diretoria", "decisão",
+    "decisao", "madrugada", "de noite", "expressão", "expressao",
+    "reação", "reacao", "planilha", "caderno", "anotação", "anotacao",
+)
+
+
+def _tem_palavra(texto, palavras):
+    alvo = _normalizar_para_comparar(texto)
+    return any(_normalizar_para_comparar(p) in alvo for p in palavras)
+
+
+def classificar_fonte_do_trecho(narracao, visual):
+    """
+    Decide de onde vem a imagem deste trecho: "ia" ou "pexels".
+
+    Ordem: [ARQUIVO REAL] sempre vai pra ilustração (é a definição de
+    cena que stock não cobre); depois as listas configuráveis; e o padrão
+    é Pexels, porque vídeo real de graça é melhor que imagem parada paga
+    quando os dois servem.
+    """
+    if "[ARQUIVO REAL]" in visual.upper() or "ARQUIVO REAL" in visual.upper():
+        return "ia"
+    if _tem_palavra(visual, PALAVRAS_FORCAM_PEXELS):
+        return "pexels"
+    if _tem_palavra(visual, PALAVRAS_FORCAM_IA) or _tem_palavra(narracao, PALAVRAS_FORCAM_IA):
+        return "ia"
+    return "pexels"
+
+
+def _aplicar_teto_de_ilustracoes(plano):
+    """
+    TETO_PROPORCAO_IA é limite, não cota: nunca empurra trecho pra IA só
+    pra bater uma porcentagem - isso geraria imagem paga pra cena que o
+    Pexels já cobria bem. Só rebaixa o excedente de volta pro Pexels,
+    começando pelos que NÃO são [ARQUIVO REAL] (esses são os que mais
+    precisam da ilustração, então são os últimos a perder a vaga).
+    """
+    indices_ia = [s["indice"] for s in plano if s["fonte"] == "ia"]
+    teto = max(1, int(len(plano) * TETO_PROPORCAO_IA))
+    teto = min(teto, MAX_AI_IMAGES_PER_VIDEO)
+    if len(indices_ia) <= teto:
+        return plano
+
+    def prioridade(segmento):
+        # menor = mais importante manter como ilustração
+        return 0 if segmento.get("arquivo_real") else 1
+
+    candidatos = sorted(
+        [s for s in plano if s["fonte"] == "ia"],
+        key=lambda s: (prioridade(s), s["indice"]),
+    )
+    for segmento in candidatos[teto:]:
+        segmento["fonte"] = "pexels"
+        segmento["motivo_fonte"] = (
+            f"rebaixado pro Pexels - passou do teto de {teto} ilustrações "
+            f"({TETO_PROPORCAO_IA:.0%} dos trechos ou MAX_AI_IMAGES_PER_VIDEO)"
+        )
+    print(
+        f"    Teto de ilustrações: {len(indices_ia)} trechos elegíveis, "
+        f"{teto} mantidos na IA, o resto volta pro Pexels."
+    )
+    return plano
+
+
+def parear_narracao_e_visual(roteiro):
+    """
+    Devolve os trechos do roteiro pareados: cada linha NARRAÇÃO com a
+    linha VISUAL que vem depois dela.
+
+    Existe porque a estrutura antiga era um DICIONÁRIO indexado pelo texto
+    da linha VISUAL - e "b-roll genérico de escritório" se repete várias
+    vezes num roteiro (o próprio prompt do roteirista usa isso como
+    exemplo). Trechos diferentes com o mesmo VISUAL colapsavam numa
+    entrada só: o manifest não conseguia representá-los, e o download
+    trazia um arquivo para os dois.
+    """
+    trechos = re.findall(
+        r"NARRAÇÃO:\s*(.*?)\s*(?:\n\s*VISUAL:\s*(.*?))?\s*(?=\nNARRAÇÃO:|\Z)",
+        roteiro,
+        re.DOTALL,
+    )
+    segmentos = []
+    for narracao, visual in trechos:
+        narracao = re.sub(r"\s+", " ", narracao).strip()
+        visual = re.sub(r"\s+", " ", (visual or "")).strip()
+        if not narracao:
+            continue
+        segmentos.append({
+            "indice": len(segmentos) + 1,
+            "narracao": narracao,
+            "visual": visual,
+        })
+    return segmentos
+
+
+def montar_plano_de_broll(roteiro):
+    """
+    Substitui montar_lista_broll(). Devolve uma LISTA de segmentos, um por
+    trecho do roteiro, já com a fonte decidida e com o resultado do Pexels
+    para os que vão de Pexels.
+
+    Só faz o que é grátis: a busca no Pexels. A geração de imagem (que
+    custa) fica para gerar_broll_ilustrado(), chamada num passo separado -
+    mesma regra do ElevenLabs neste pipeline: nada pago acontece sem você
+    mandar.
+    """
+    plano = parear_narracao_e_visual(roteiro)
+    for segmento in plano:
+        visual = segmento["visual"]
+        segmento["arquivo_real"] = "ARQUIVO REAL" in visual.upper()
+        if not USAR_BROLL_IA:
+            segmento["fonte"] = "arquivo_real" if segmento["arquivo_real"] else "pexels"
+        else:
+            segmento["fonte"] = classificar_fonte_do_trecho(segmento["narracao"], visual)
+        segmento["arquivo"] = None
+        segmento["resultados_pexels"] = []
+
+    if USAR_BROLL_IA:
+        plano = _aplicar_teto_de_ilustracoes(plano)
+
+    for segmento in plano:
+        if segmento["fonte"] != "pexels":
+            continue
+        visual = segmento["visual"]
+        if not visual:
+            segmento["motivo_fonte"] = "trecho sem linha VISUAL no roteiro"
+            continue
+        termo_en = traduzir_termo_busca(visual)
+        print(f"    [{segmento['indice']:02d}] Pexels: '{visual}' -> '{termo_en}'")
+        segmento["termo_busca"] = termo_en
+        segmento["resultados_pexels"] = buscar_broll_com_alternativas(termo_en, visual)
+
+    ilustrados = sum(1 for s in plano if s["fonte"] == "ia")
+    if ilustrados:
+        print(
+            f"    {ilustrados} trecho(s) marcados para ilustração - nenhuma "
+            "imagem foi gerada ainda (é o passo pago/separado)."
+        )
+    return plano
+
+
+# -------------------------------------------------------------------------
+# Ficha de personagem e descrição de cena
+# -------------------------------------------------------------------------
+
+def gerar_ficha_de_personagem(tema, roteiro):
+    """
+    Uma chamada ao LLM no começo do vídeo, descrevendo em inglês o
+    personagem recorrente (roupa, acessórios, ambiente) - a "folha de
+    personagem" em texto. Essa descrição entra em TODAS as imagens
+    seguintes, e é o que faz o mesmo sujeito aparecer em cenas
+    diferentes sem imagem de referência.
+    """
+    prompt = (
+        "Read the video script below and describe, in ENGLISH, ONE recurring "
+        "character to appear in every illustration of this video.\n\n"
+        "Answer with a single line of at most 30 words, no commentary. "
+        "Describe ONLY stable visual traits that must repeat in every scene: "
+        "clothing (colors and garments), build, hair or lack of it, and one "
+        "accessory. Do NOT describe facial features (the art style uses a "
+        "blank round head with dot eyes). Do NOT name a real person or a "
+        "real brand.\n\n"
+        "Example of the expected format: bald character in a mustard yellow "
+        "t-shirt and blue denim apron, thin black stick arms, pencil behind "
+        "the ear\n\n"
+        f"TOPIC: {tema}\n\n"
+        f"SCRIPT:\n{_truncar(roteiro, 4000, 'roteiro')}"
+    )
+    try:
+        resposta = chamar_llm(prompt, temperature=0.4, max_tokens=300, avisar_corte=False)
+    except Exception as erro:
+        print(f"    (ficha de personagem: LLM falhou - {type(erro).__name__})")
+        return FICHA_PERSONAGEM_PADRAO
+
+    linhas = [l.strip(" -*\"'") for l in (resposta or "").splitlines() if l.strip()]
+    ficha = linhas[-1] if linhas else ""
+    ficha = re.sub(r"^(character|ficha|answer|resposta)\s*[:\-]\s*", "", ficha, flags=re.I)
+    if len(ficha) < 15 or len(ficha) > 400:
+        return FICHA_PERSONAGEM_PADRAO
+    return ficha
+
+
+def descrever_cena_para_imagem(narracao, visual):
+    """
+    Converte o trecho do roteiro numa descrição de cena em inglês, curta e
+    concreta - o que a ilustração mostra, não o que a narração diz.
+    """
+    prompt = (
+        "Turn the script excerpt below into ONE short English sentence "
+        "describing what a single illustrated panel should show.\n\n"
+        "Rules: at most 25 words; describe a concrete visible scene "
+        "(who is doing what, where); no camera directions; no real brand "
+        "names, logos or real people; do not mention numbers or statistics; "
+        "answer with the sentence only, nothing else.\n\n"
+        f"NARRATION: {narracao[:600]}\n"
+        f"VISUAL NOTE: {visual[:300]}"
+    )
+    try:
+        resposta = chamar_llm(prompt, temperature=0.5, max_tokens=300, avisar_corte=False)
+    except Exception as erro:
+        print(f"    (descrição de cena: LLM falhou - {type(erro).__name__})")
+        return ""
+    linhas = [l.strip(" -*\"'") for l in (resposta or "").splitlines() if l.strip()]
+    descricao = linhas[-1] if linhas else ""
+    descricao = re.sub(r"^(scene|description|answer)\s*[:\-]\s*", "", descricao, flags=re.I)
+    return descricao[:300]
+
+
+def montar_prompt_de_imagem(descricao_cena, ficha_personagem):
+    """Junta cena + personagem + estilo fixo, nessa ordem: o que acontece,
+    quem aparece, e como é desenhado."""
+    partes = [p for p in (descricao_cena, ficha_personagem, ESTILO_IMAGEM_IA) if p]
+    return ". ".join(partes)
+
+
+# -------------------------------------------------------------------------
+# Clientes de geração de imagem
+# -------------------------------------------------------------------------
+
+def _gerar_imagem_pollinations(prompt, caminho, semente):
+    """
+    Pollinations: gratuito e SEM CHAVE de API - por isso é o padrão aqui.
+    A imagem vem direto na resposta de um GET.
+
+    Limitação conhecida: não aceita imagem de referência. Neste estilo
+    isso pesa pouco (ver comentário no topo da seção), mas é o motivo de
+    a ficha de personagem em texto existir.
+    """
+    from urllib.parse import quote
+
+    url = (
+        "https://image.pollinations.ai/prompt/"
+        + quote(prompt[:1500])
+        + f"?width={IMAGEM_IA_LARGURA}&height={IMAGEM_IA_ALTURA}"
+        + f"&seed={semente}&nologo=true&model={POLLINATIONS_MODELO}"
+    )
+    resposta = requests.get(url, timeout=IMAGEM_IA_TIMEOUT_S)
+    resposta.raise_for_status()
+    if not resposta.content or len(resposta.content) < 1000:
+        raise ValueError("resposta vazia ou pequena demais para ser uma imagem")
+    with open(caminho, "wb") as arquivo:
+        arquivo.write(resposta.content)
+    return caminho
+
+
+def _gerar_imagem_huggingface(prompt, caminho, semente):
+    """
+    Hugging Face Inference API: gratuito com token (também grátis), mas
+    com fila e limite por hora. Alternativa pra quando o Pollinations
+    estiver fora do ar ou devolvendo imagem ruim.
+    """
+    if not HUGGINGFACE_TOKEN:
+        raise ValueError("HUGGINGFACE_TOKEN não configurado no .env")
+    resposta = requests.post(
+        f"https://api-inference.huggingface.co/models/{HUGGINGFACE_MODELO_IMAGEM}",
+        headers={"Authorization": f"Bearer {HUGGINGFACE_TOKEN}"},
+        json={"inputs": prompt[:1500], "parameters": {"seed": semente}},
+        timeout=IMAGEM_IA_TIMEOUT_S,
+    )
+    resposta.raise_for_status()
+    if resposta.headers.get("content-type", "").startswith("application/json"):
+        raise ValueError(f"API devolveu JSON em vez de imagem: {resposta.text[:200]}")
+    with open(caminho, "wb") as arquivo:
+        arquivo.write(resposta.content)
+    return caminho
+
+
+_PROVEDORES_DE_IMAGEM = {
+    "pollinations": _gerar_imagem_pollinations,
+    "huggingface": _gerar_imagem_huggingface,
+}
+
+
+def gerar_imagem_ia(prompt, caminho, semente=0):
+    """Despacha pro provedor configurado em PROVEDOR_IMAGEM."""
+    gerador = _PROVEDORES_DE_IMAGEM.get(PROVEDOR_IMAGEM)
+    if not gerador:
+        raise ValueError(
+            f"PROVEDOR_IMAGEM='{PROVEDOR_IMAGEM}' desconhecido. "
+            f"Disponíveis: {', '.join(_PROVEDORES_DE_IMAGEM)}"
+        )
+    return gerador(prompt, caminho, semente)
+
+
+def gerar_broll_ilustrado(plano, pasta_destino, tema="", roteiro=""):
+    """
+    Passo PAGO/lento, separado da montagem do plano: gera uma imagem por
+    trecho marcado como "ia".
+
+    Controle de custo e queda para o Pexels:
+      - para em MAX_AI_IMAGES_PER_VIDEO, mesmo que sobrem trechos;
+      - qualquer falha na geração devolve aquele trecho pro Pexels, em vez
+        de deixar o trecho sem imagem;
+      - imagem que já existe no disco não é gerada de novo (reaproveita
+        quando você repete a etapa).
+
+    Devolve (gerados, rebaixados).
+    """
+    pendentes = [s for s in plano if s["fonte"] == "ia"]
+    if not pendentes:
+        return [], []
+
+    pasta_destino.mkdir(parents=True, exist_ok=True)
+    ficha = gerar_ficha_de_personagem(tema, roteiro) if roteiro else FICHA_PERSONAGEM_PADRAO
+    print(f"    Ficha de personagem: {ficha}")
+
+    gerados = []
+    rebaixados = []
+    for posicao, segmento in enumerate(pendentes):
+        if len(gerados) >= MAX_AI_IMAGES_PER_VIDEO:
+            segmento["fonte"] = "pexels"
+            segmento["motivo_fonte"] = (
+                f"limite de {MAX_AI_IMAGES_PER_VIDEO} imagens do vídeo atingido"
+            )
+            rebaixados.append(segmento)
+            continue
+
+        nome = f"{segmento['indice']:02d}_ia_{_slugificar(segmento['visual'] or segmento['narracao'])}.jpg"
+        caminho = pasta_destino / nome
+        if caminho.exists():
+            print(f"    [{segmento['indice']:02d}] imagem já existe, reaproveitando: {nome}")
+            segmento["arquivo"] = nome
+            gerados.append(nome)
+            continue
+
+        descricao = descrever_cena_para_imagem(segmento["narracao"], segmento["visual"])
+        if not descricao:
+            descricao = segmento["visual"] or segmento["narracao"][:120]
+        prompt = montar_prompt_de_imagem(descricao, ficha)
+        segmento["prompt_imagem"] = prompt
+        segmento["descricao_cena"] = descricao
+
+        try:
+            print(f"    [{segmento['indice']:02d}] gerando ilustração: {descricao[:70]}...")
+            gerar_imagem_ia(prompt, caminho, semente=1000 + posicao)
+            segmento["arquivo"] = nome
+            gerados.append(nome)
+        except Exception as erro:
+            print(
+                f"    [{segmento['indice']:02d}] falhou ({type(erro).__name__}: "
+                f"{str(erro)[:120]}) - esse trecho volta pro Pexels."
+            )
+            segmento["fonte"] = "pexels"
+            segmento["motivo_fonte"] = f"geração falhou ({type(erro).__name__})"
+            rebaixados.append(segmento)
+
+    # Os rebaixados ainda não têm busca feita (o plano só buscou os que já
+    # eram de Pexels) - resolve agora, senão ficam sem imagem nenhuma.
+    for segmento in rebaixados:
+        visual = segmento["visual"]
+        if not visual or segmento.get("resultados_pexels"):
+            continue
+        termo_en = traduzir_termo_busca(visual)
+        segmento["termo_busca"] = termo_en
+        segmento["resultados_pexels"] = buscar_broll_com_alternativas(termo_en, visual)
+
+    print(f"    {len(gerados)} ilustração(ões) gerada(s), {len(rebaixados)} trecho(s) devolvido(s) ao Pexels.")
+    return gerados, rebaixados
+
+
+# -------------------------------------------------------------------------
+# Manifest
+# -------------------------------------------------------------------------
+
+def montar_manifest(plano, tema=""):
+    """
+    JSON com um item por trecho, na ordem do roteiro, pra importar
+    organizado no editor. Sem tempo: a ordem e o texto da narração são o
+    que alinha cada imagem no CapCut.
+    """
+    itens = []
+    for segmento in plano:
+        itens.append({
+            "ordem": segmento["indice"],
+            "fonte": segmento["fonte"],
+            "arquivo": segmento.get("arquivo"),
+            "narracao": segmento["narracao"],
+            "visual": segmento["visual"],
+            "termo_busca": segmento.get("termo_busca"),
+            "prompt_imagem": segmento.get("prompt_imagem"),
+            "observacao": segmento.get("motivo_fonte"),
+        })
+    return {
+        "tema": tema,
+        "gerado_em": datetime.now().isoformat(timespec="seconds"),
+        "total_trechos": len(itens),
+        "por_fonte": {
+            fonte: sum(1 for i in itens if i["fonte"] == fonte)
+            for fonte in sorted({i["fonte"] for i in itens})
+        },
+        "trechos": itens,
+    }
+
+
+def salvar_manifest(plano, caminho, tema=""):
+    manifest = montar_manifest(plano, tema)
+    with open(caminho, "w", encoding="utf-8") as arquivo:
+        json.dump(manifest, arquivo, ensure_ascii=False, indent=2)
+    return caminho
 
 
 # =========================================================================
@@ -3956,8 +4459,8 @@ def gerar_video_completo(tema, max_tentativas=4, pesquisar=None):
             f"{sem_respaldo} sem respaldo (veja o checklist no .txt)."
         )
 
-    print("Buscando b-roll correspondente no Pexels...")
-    broll = montar_lista_broll(roteiro)
+    print("Montando o plano de b-roll (Pexels agora; ilustrações no passo separado)...")
+    broll = montar_plano_de_broll(roteiro)
 
     print("Gerando título, thumbnail, descrição e tags...")
     metadados = gerar_metadados(tema, roteiro)
@@ -4461,16 +4964,34 @@ def montar_relatorio_txt(resultado):
     partes.append(resultado["prompt_imagem_gemini"])
 
     partes.append("\n\n" + "=" * 70)
-    partes.append("### B-ROLL ENCONTRADO POR TRECHO ###\n")
-    for termo, dados in resultado["broll"].items():
-        partes.append(f"- {termo}")
-        if isinstance(dados, dict) and dados.get("tipo") == "arquivo_real_necessario":
-            partes.append("  (precisa de foto/vídeo real de arquivo, não de banco de stock)")
-        elif dados:
-            for item in dados:
-                partes.append(f"  {item['preview']}")
-        else:
-            partes.append("  (nenhum resultado encontrado)")
+    partes.append("### B-ROLL POR TRECHO (na ordem do roteiro) ###\n")
+    plano = resultado.get("broll") or []
+    if isinstance(plano, dict):
+        plano = _plano_a_partir_de_dict_antigo(plano)
+    for posicao, segmento in enumerate(plano, 1):
+        # .get com padrão: o relatório também abre JSON salvo por versões
+        # anteriores, onde o segmento não tinha esses campos.
+        fonte = segmento.get("fonte", "pexels")
+        rotulo = {"ia": "ILUSTRAÇÃO", "pexels": "PEXELS",
+                  "arquivo_real": "ARQUIVO REAL"}.get(fonte, fonte)
+        indice = segmento.get("indice", posicao)
+        partes.append(f"[{indice:02d}] {rotulo}: {segmento.get('visual') or '(sem linha VISUAL)'}")
+        if segmento.get("narracao"):
+            partes.append(f"     narração: {segmento['narracao'][:110]}")
+        if segmento.get("arquivo"):
+            partes.append(f"     arquivo: {segmento['arquivo']}")
+        if segmento.get("motivo_fonte"):
+            partes.append(f"     obs: {segmento['motivo_fonte']}")
+        if fonte == "ia" and not segmento.get("arquivo"):
+            partes.append("     (ilustração ainda não gerada - é o passo separado)")
+        elif fonte == "pexels":
+            for item in (segmento.get("resultados_pexels") or [])[:2]:
+                partes.append(f"     {item['preview']}")
+            if not segmento.get("resultados_pexels"):
+                partes.append("     (nenhum resultado encontrado)")
+        elif fonte == "arquivo_real":
+            partes.append("     (precisa de foto/vídeo real de arquivo, não de banco de stock)")
+        partes.append("")
 
     return "\n".join(partes)
 
@@ -4586,7 +5107,17 @@ if __name__ == "__main__":
 
     print("Baixando clipes de b-roll...")
     pasta_broll = pasta_saidas / f"video_{carimbo}_broll"
+    if USAR_BROLL_IA:
+        print("Gerando as ilustrações dos trechos específicos...")
+        gerar_broll_ilustrado(
+            resultado["broll"], pasta_broll,
+            tema=resultado["tema"], roteiro=resultado["roteiro"],
+        )
     baixados, pulados = baixar_broll(resultado["broll"], pasta_broll)
+    caminho_manifest = salvar_manifest(
+        resultado["broll"], pasta_broll / "manifest.json", resultado["tema"]
+    )
+    print(f"  Manifest do b-roll: {caminho_manifest}")
 
     print("\nConcluído!")
     print(f"  Texto legível (abra no Bloco de Notas): {caminho_txt}")
