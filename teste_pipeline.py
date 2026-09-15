@@ -89,6 +89,38 @@ def testar_filtro():
            pipe.assinatura_do_pedido("Adicione X e Y")
            == pipe.assinatura_do_pedido("adicione Y e X."))
 
+    # Casos vindos de um run real: o crítico pediu marcador em número que
+    # o código já tinha marcado, e pediu pra nomear a empresa na abertura
+    # (o que a regra do canal proíbe). Os dois travavam o loop.
+    roteiro_marcado = pipe.marcar_verificar_automatico(
+        "NARRAÇÃO: The 2015 financial crisis hit the utility hard.\n"
+        "VISUAL: b-roll genérico de escritório\n"
+        "NARRAÇÃO: By 2024, only 375 neighborhoods had been connected.\n"
+        "VISUAL: b-roll genérico de obra")[0]
+    acionavel, descartados = pipe.filtrar_mudancas_acionaveis(
+        '- Add [VERIFICAR] next to 2015, 2024, 375 on the NARRAÇÃO lines.\n'
+        '- Name the company "Sabesp" in the opening lines.\n'
+        '- Remova o jargão "outorga onerosa" ou explique em uma frase.',
+        roteiro=roteiro_marcado)
+    checar("não repete pedido de [VERIFICAR] já atendido pelo código",
+           "2015, 2024, 375" not in acionavel, acionavel)
+    checar("recusa pedido de nomear a empresa na abertura",
+           "Sabesp" not in acionavel, acionavel)
+    checar("mantém o pedido legítimo da mesma lista",
+           "outorga onerosa" in acionavel, acionavel)
+    checar("registra o motivo de cada descarte",
+           len(descartados) == 2 and all(d.get("motivo") for d in descartados),
+           str(descartados))
+
+    sem_marcador = "NARRAÇÃO: Foram 900 ligações no bairro.\nVISUAL: b-roll"
+    acionavel, _ = pipe.filtrar_mudancas_acionaveis(
+        "- Add [VERIFICAR] next to 900.", roteiro=sem_marcador)
+    checar("número de fato sem marcador continua reprovando", "900" in acionavel)
+    acionavel, _ = pipe.filtrar_mudancas_acionaveis(
+        "- Nomeie a empresa real no miolo do roteiro.", roteiro=roteiro_marcado)
+    checar("nomear a empresa no MIOLO continua sendo pedido válido",
+           "miolo" in acionavel, acionavel)
+
 
 # =========================================================================
 # 3. LEITURA DA RESPOSTA DO CRÍTICO
@@ -282,8 +314,13 @@ def testar_fluxo_completo():
         if "editor crítico de retenção" in prompt or "audience-retention critic" in prompt:
             rodadas["critico"] += 1
             if rodadas["critico"] == 1:
+                # O pedido tem que ser algo que o CÓDIGO não resolve
+                # sozinho - se fosse "adicione [VERIFICAR] em 18%", o
+                # filtro descartaria (já está marcado) e o roteiro seria
+                # aprovado de primeira, sem exercitar o loop.
                 return _avaliacao(
-                    "\n- Adicione [VERIFICAR] no corte de 18% do orçamento."
+                    '\n- Remova o jargão "roteirização dinâmica" ou explique'
+                    " em uma frase simples."
                     "\n- Considerar a possibilidade de reforçar o fecho.",
                     "REPROVADO",
                     evento="O corte de 18% não aparece no dossiê",

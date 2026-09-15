@@ -257,8 +257,11 @@ with aba_novo:
                 # Sugestões não reprovam mais o roteiro sozinhas (ver
                 # filtrar_mudancas_acionaveis no pipeline), mas continuam
                 # aqui porque costumam ser um bom ajuste manual.
-                for sugestao in item.get("sugestoes_nao_bloqueantes", []):
-                    st.caption(f"Sugestão (não reprovou): {sugestao}")
+                for descartado in item.get("sugestoes_nao_bloqueantes", []):
+                    st.caption(
+                        f"Não reprovou ({pipe._motivo_do_descarte(descartado)}): "
+                        f"{pipe._texto_do_descarte(descartado)}"
+                    )
 
         st.divider()
         st.subheader("2. Próximos passos (cada um é opcional e independente)")

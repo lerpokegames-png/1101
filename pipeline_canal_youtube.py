@@ -580,8 +580,14 @@ real. Marque especialmente qualquer trecho que impute MÁ-FÉ DELIBERADA
 algoritmos pra explorar) - isso é acusação, não descrição, e sempre precisa
 de [VERIFICAR]. Ou escreva "Nenhum encontrado"]
 
-EMPRESA IDENTIFICÁVEL MAS NÃO NOMEADA: [o roteiro tem que nomear a empresa
-real no corpo do texto. Se ele evita o nome mas acumula detalhes que
+EMPRESA IDENTIFICÁVEL MAS NÃO NOMEADA: [ATENÇÃO - a INTRODUÇÃO não conta
+aqui: ela esconde o nome da empresa DE PROPÓSITO, é o gancho do vídeo e
+regra fixa deste canal. NUNCA peça pra nomear a empresa na introdução, na
+abertura ou nas primeiras linhas - esse pedido contraria a regra que o
+roteirista é obrigado a seguir, então ele nunca vai poder atender, e o
+roteiro fica preso reprovando pra sempre. O que se avalia neste campo é o
+CORPO do texto (backstory, miolo, conclusão): lá o roteiro tem que nomear
+a empresa real. Se ele evita o nome mas acumula detalhes que
 identificam uma empresa específica mesmo assim (ano de fundação + setor +
 rodada de captação + data do IPO + avaliação), isso é o pior dos dois
 mundos: não tem a proteção de discussão genérica e ainda quebra a regra de
@@ -612,6 +618,14 @@ sabe mexer no texto e não tem como pesquisar nada):
 - PROIBIDO escrever sugestão aqui ("considere", "seria bom", "poderia").
   Este campo é só do que REPROVA o roteiro. Sugestão vai nos campos de
   cima, não aqui.
+- Antes de pedir [VERIFICAR] num número, CONFIRA se ele já não está
+  marcado na linha. O pipeline marca os números automaticamente antes de
+  você ver o roteiro, então pedir de novo é pedir algo que já está feito -
+  o roteirista não tem o que fazer e a rodada inteira é perdida.
+- PROIBIDO pedir pra nomear a empresa na introdução/abertura/primeiras
+  linhas. A introdução esconde o nome de propósito (é o gancho). Se o
+  problema é o corpo do texto não nomear, diga isso: "Nomeie a empresa no
+  backstory/miolo".
 - Se o item já foi pedido numa rodada anterior e o roteirista atendeu,
   NÃO repita. Repetir o mesmo pedido trava o roteiro no mesmo lugar.]
 
@@ -932,8 +946,14 @@ FAITH (quietly targeting users, hiding fees on purpose, refining
 algorithms to exploit) - that is an accusation, not a description, and
 always needs [VERIFICAR]. Or write "Nenhum encontrado"]
 
-EMPRESA IDENTIFICÁVEL MAS NÃO NOMEADA: [the script must name the real
-company in the body. If it avoids the name yet piles up details that
+EMPRESA IDENTIFICÁVEL MAS NÃO NOMEADA: [WARNING - the INTRO does not
+count here: it hides the company name ON PURPOSE, that is the video's
+hook and a fixed rule of this channel. NEVER ask to name the company in
+the intro, the opening or the first lines - that request contradicts the
+rule the writer must follow, so he can never satisfy it, and the script
+stays stuck failing forever. What you judge in this field is the BODY
+(backstory, core, conclusion): there the script must name the real
+company. If it avoids the name yet piles up details that
 identify one specific company anyway (founding year + sector + funding
 round + IPO date + valuation), that is the worst of both worlds: no
 generic-discussion protection, and the naming rule broken. Quote the
@@ -964,6 +984,14 @@ can only edit text and cannot research anything):
 - FORBIDDEN to write a suggestion here ("consider", "it would be good",
   "could"). This field is only what FAILS the script. Suggestions belong
   in the fields above, not here.
+- Before asking for [VERIFICAR] on a number, CHECK whether it is already
+  marked on that line. The pipeline marks numbers automatically before
+  you see the script, so asking again is asking for something already
+  done - the writer has nothing to do and the whole round is wasted.
+- FORBIDDEN to ask to name the company in the intro/opening/first lines.
+  The intro hides the name on purpose (it is the hook). If the problem is
+  that the BODY never names it, say that: "Name the company in the
+  backstory/core".
 - If an item was already requested in an earlier round and the writer
   complied, do NOT repeat it. Repeating the same request freezes the
   script in place.]
@@ -2988,6 +3016,71 @@ def _item_e_lista_solta(item):
     return len(palavras) <= 2
 
 
+def _pedido_ja_atendido(item, roteiro):
+    """
+    O crítico está pedindo [VERIFICAR] em número que o código JÁ marcou?
+
+    Acontece de verdade: num run real o pipeline marcou 8 números e o
+    crítico devolveu "Add [VERIFICAR] next to 2015, 2024, 375" mesmo com
+    os três marcados no texto. Modelo de 7B lê mal marcador no meio da
+    frase. Sem esta checagem, o roteirista recebe uma ordem impossível de
+    cumprir (já está feito), devolve o mesmo roteiro, e a tentativa vira
+    lixo - exatamente o ciclo que a trava de repetição tenta cortar, só
+    que uma rodada tarde demais.
+
+    Conservador de propósito: só descarta se TODA ocorrência de TODO
+    número citado já estiver marcada. Se algum número do pedido nem
+    aparece no roteiro, mantém o pedido.
+    """
+    if not roteiro or "[VERIFICAR]" not in item.upper():
+        return False
+    numeros = [achado.group(0) for achado in _PADRAO_NUMERO_ESPECIFICO.finditer(item)]
+    if not numeros:
+        return False
+
+    linhas_narradas = [
+        linha for linha in roteiro.splitlines()
+        if _INICIO_LINHA_NARRACAO.match(linha)
+    ]
+    achou_alguma_ocorrencia = False
+    for numero in numeros:
+        for linha in linhas_narradas:
+            posicao = linha.find(numero)
+            while posicao != -1:
+                achou_alguma_ocorrencia = True
+                vizinhanca = linha[
+                    max(0, posicao - _RAIO_DO_MARCADOR):
+                    posicao + len(numero) + _RAIO_DO_MARCADOR
+                ]
+                if "[VERIFICAR]" not in vizinhanca:
+                    return False
+                posicao = linha.find(numero, posicao + 1)
+    return achou_alguma_ocorrencia
+
+
+def _pedido_quebra_regra_do_canal(comparavel):
+    """
+    Pedido que contraria uma regra fixa do canal não pode reprovar o
+    roteiro - se aceito, vira loop infinito: o roteirista cumpre a regra,
+    o crítico exige o contrário, sempre.
+
+    O caso real: "Name the company 'Sabesp' in the opening lines". A
+    introdução esconde o nome da empresa DE PROPÓSITO (é o gancho); a
+    regra é nomear no corpo do texto. Atender isso quebraria o vídeo.
+    """
+    fala_em_nomear = any(v in comparavel for v in (
+        "nomear", "nomeie", "cite o nome", "citar o nome", "mencione o nome",
+        "revele o nome", "name the company", "mention the name",
+        "reveal the name", "state the company",
+    ))
+    fala_em_abertura = any(v in comparavel for v in (
+        "introducao", "abertura", "gancho", "primeiras linhas",
+        "primeiras frases", "opening", "intro", "first lines",
+        "first sentences", "beginning",
+    ))
+    return fala_em_nomear and fala_em_abertura
+
+
 def _normalizar_para_comparar(texto):
     """Minúsculas, sem acento e sem pontuação - pra comparar dois pedidos
     do crítico e saber se são o mesmo pedido escrito de outro jeito."""
@@ -3007,19 +3100,24 @@ def _dividir_em_itens(mudancas_texto):
     return itens
 
 
-def filtrar_mudancas_acionaveis(mudancas_texto):
+def filtrar_mudancas_acionaveis(mudancas_texto, roteiro=None):
     """
     Transforma a lista do crítico em pedidos que o roteirista consegue de
-    fato executar, e devolve (texto_acionavel, itens_descartados).
+    fato executar, e devolve (texto_acionavel, itens_descartados) - cada
+    descartado é {"item", "motivo"}.
 
-    Três tratamentos:
+    Cinco tratamentos:
       1. lista solta de números -> vira uma ORDEM ("adicione [VERIFICAR]
          ao lado destes números"), em vez de chegar sem verbo nenhum;
       2. pedido de pesquisa ("verifique a veracidade") -> vira a única
          ação equivalente que o roteirista tem: marcar [VERIFICAR];
       3. sugestão ("considere", "seria bom") -> sai da lista obrigatória.
          Continua contando no aprendizado e continua aparecendo no
-         relatório, só não reprova mais o roteiro sozinha.
+         relatório, só não reprova mais o roteiro sozinha;
+      4. pedido de [VERIFICAR] em número que o código já marcou -> sai,
+         porque não há o que fazer (ver _pedido_ja_atendido);
+      5. pedido que contraria regra fixa do canal, tipo nomear a empresa
+         na introdução -> sai (ver _pedido_quebra_regra_do_canal).
 
     Se depois disso não sobrar nada, o roteiro não tinha nenhuma mudança
     obrigatória de verdade - e o chamador trata como aprovado.
@@ -3035,6 +3133,20 @@ def filtrar_mudancas_acionaveis(mudancas_texto):
         if not comparavel or comparavel in ("nenhuma", "nenhum"):
             continue
 
+        if _pedido_ja_atendido(item, roteiro):
+            descartados.append({
+                "item": item,
+                "motivo": "já atendido - o código marcou esses números automaticamente",
+            })
+            continue
+
+        if _pedido_quebra_regra_do_canal(comparavel):
+            descartados.append({
+                "item": item,
+                "motivo": "contraria regra do canal (a introdução não revela o nome da empresa)",
+            })
+            continue
+
         if _item_e_lista_solta(item):
             item = (
                 "Adicione [VERIFICAR] na própria linha NARRAÇÃO, ao lado de "
@@ -3044,7 +3156,7 @@ def filtrar_mudancas_acionaveis(mudancas_texto):
             item = _ACAO_MARCAR_EVENTOS
         elif any(comparavel.startswith(m) or f" {m}" in f" {comparavel}"
                  for m in _MARCAS_DE_SUGESTAO):
-            descartados.append(item)
+            descartados.append({"item": item, "motivo": "sugestão, não requisito"})
             continue
 
         chave = _normalizar_para_comparar(item)
@@ -3696,9 +3808,11 @@ def gerar_video_completo(tema, max_tentativas=4, pesquisar=None):
         # resto (sugestão, pedido de pesquisa solto, lista de números sem
         # instrução) é tratado ou descartado aqui - ver
         # filtrar_mudancas_acionaveis.
-        mudancas, apenas_sugestoes = filtrar_mudancas_acionaveis(mudancas_brutas)
-        for sugestao in apenas_sugestoes:
-            print(f"    (sugestão, não bloqueia): {sugestao}")
+        mudancas, nao_bloqueantes = filtrar_mudancas_acionaveis(
+            mudancas_brutas, roteiro=roteiro
+        )
+        for descartado in nao_bloqueantes:
+            print(f"    (não bloqueia - {descartado['motivo']}): {descartado['item']}")
 
         if veredito == "reprovado" and mudancas_sao_vazias(mudancas):
             print(
@@ -3722,7 +3836,7 @@ def gerar_video_completo(tema, max_tentativas=4, pesquisar=None):
                 "tentativa": tentativa,
                 "veredito": veredito,
                 "mudancas_pedidas": mudancas,
-                "sugestoes_nao_bloqueantes": apenas_sugestoes,
+                "sugestoes_nao_bloqueantes": nao_bloqueantes,
             }
         )
 
@@ -4263,6 +4377,20 @@ def gerar_audio_elevenlabs(texto_narracao_limpo, caminho_saida_mp3, pedir_confir
     return str(caminho_final)
 
 
+def _texto_do_descarte(descartado):
+    """Aceita os dois formatos: o dicionário novo {"item","motivo"} e a
+    string simples usada nos JSON salvos antes desta mudança."""
+    if isinstance(descartado, dict):
+        return descartado.get("item", "")
+    return str(descartado)
+
+
+def _motivo_do_descarte(descartado):
+    if isinstance(descartado, dict):
+        return descartado.get("motivo", "não bloqueia")
+    return "sugestão, não requisito"
+
+
 def montar_relatorio_txt(resultado):
     """Monta uma versão em texto puro do resultado, formatada pra leitura
     fácil no Bloco de Notas (ou qualquer editor) - sem chaves, aspas
@@ -4319,8 +4447,9 @@ def montar_relatorio_txt(resultado):
             partes.append(f"Tentativa {item['tentativa']}: {item['veredito'].upper()}")
             if item["veredito"] == "reprovado":
                 partes.append(f"  Motivo: {item['mudancas_pedidas']}")
-            for sugestao in item.get("sugestoes_nao_bloqueantes", []):
-                partes.append(f"  Sugestão (não reprovou): {sugestao}")
+            for descartado in item.get("sugestoes_nao_bloqueantes", []):
+                partes.append(f"  Não reprovou ({_motivo_do_descarte(descartado)}): "
+                              f"{_texto_do_descarte(descartado)}")
             partes.append("")
 
     partes.append("\n\n" + "=" * 70)
