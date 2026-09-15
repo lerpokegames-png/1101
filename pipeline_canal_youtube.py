@@ -303,11 +303,31 @@ IMAGEM_IA_LARGURA = 2048
 IMAGEM_IA_ALTURA = 1152
 IMAGEM_IA_TIMEOUT_S = 180
 
-# Usada quando o LLM não devolve uma ficha aproveitável.
-FICHA_PERSONAGEM_PADRAO = (
-    "the same recurring character in every scene: bald round head, mustard "
-    "yellow t-shirt under a blue denim apron, thin black stick arms"
+# QUEM É O PERSONAGEM DO CANAL.
+#
+# Preenchido = esse personagem em TODOS os vídeos, sempre a mesma roupa.
+# É o modo "mascote do canal": o espectador reconhece o sujeito de um
+# vídeo pro outro, e economiza uma chamada ao LLM por vídeo.
+#
+# Vazio ("") = o LLM escolhe a roupa por vídeo, a partir do roteiro (num
+# vídeo sobre uma lojinha ele viria de avental; num sobre uma diretoria,
+# de terno). Mais fiel a cada história, mas o personagem muda de cara
+# entre vídeos.
+#
+# O QUE NUNCA MUDA DENTRO DO MESMO VÍDEO é a roupa: sem imagem de
+# referência, ela é a ÚNICA âncora de consistência que sobra - a cabeça é
+# um círculo sem rosto, não há traço facial pra reconhecer. O que varia de
+# cena pra cena é gesto, expressão, cenário e objetos, que é exatamente o
+# que descrever_cena_para_imagem() extrai do roteiro.
+FICHA_PERSONAGEM_FIXA = (
+    "the same recurring character in every scene: bald round head, dark "
+    "navy business suit, white dress shirt, thin dark tie, thin black "
+    "stick arms"
 )
+
+# Usada quando FICHA_PERSONAGEM_FIXA está vazia e o LLM não devolve uma
+# ficha aproveitável.
+FICHA_PERSONAGEM_PADRAO = FICHA_PERSONAGEM_FIXA
 
 # =========================================================================
 # PESQUISA DE FATOS (agente 0) - o que o roteirista lê antes de escrever
@@ -3693,12 +3713,17 @@ def montar_plano_de_broll(roteiro):
 
 def gerar_ficha_de_personagem(tema, roteiro):
     """
-    Uma chamada ao LLM no começo do vídeo, descrevendo em inglês o
-    personagem recorrente (roupa, acessórios, ambiente) - a "folha de
-    personagem" em texto. Essa descrição entra em TODAS as imagens
-    seguintes, e é o que faz o mesmo sujeito aparecer em cenas
-    diferentes sem imagem de referência.
+    A "folha de personagem" em texto: a descrição que entra em TODAS as
+    imagens do vídeo e faz o mesmo sujeito aparecer em cenas diferentes
+    sem imagem de referência.
+
+    Com FICHA_PERSONAGEM_FIXA preenchida, devolve ela direto - o
+    personagem é o mesmo em todo vídeo do canal e nem gasta chamada de
+    LLM. Vazia, o LLM escolhe a roupa a partir do roteiro.
     """
+    if FICHA_PERSONAGEM_FIXA.strip():
+        return FICHA_PERSONAGEM_FIXA.strip()
+
     prompt = (
         "Read the video script below and describe, in ENGLISH, ONE recurring "
         "character to appear in every illustration of this video.\n\n"
@@ -3733,13 +3758,27 @@ def descrever_cena_para_imagem(narracao, visual):
     Converte o trecho do roteiro numa descrição de cena em inglês, curta e
     concreta - o que a ilustração mostra, não o que a narração diz.
     """
+    # O que a frase precisa carregar é justamente o que MUDA de cena pra
+    # cena: gesto, expressão, cenário e objetos. A roupa NÃO entra aqui -
+    # ela vem da ficha de personagem e tem que ser igual no vídeo inteiro,
+    # senão o espectador não reconhece que é o mesmo sujeito.
     prompt = (
         "Turn the script excerpt below into ONE short English sentence "
         "describing what a single illustrated panel should show.\n\n"
-        "Rules: at most 25 words; describe a concrete visible scene "
-        "(who is doing what, where); no camera directions; no real brand "
-        "names, logos or real people; do not mention numbers or statistics; "
-        "answer with the sentence only, nothing else.\n\n"
+        "The sentence MUST contain these three things:\n"
+        "1. the character's POSE or GESTURE (what he is doing with his "
+        "hands and body: holding a calculator, pointing at a screen, "
+        "head in hands, arms crossed);\n"
+        "2. his FACIAL EXPRESSION in one word (frustrated, shocked, "
+        "tired, focused, satisfied);\n"
+        "3. the SETTING and the objects around him (store counter with "
+        "invoices, office desk at night with spreadsheets, warehouse "
+        "aisle with boxes).\n\n"
+        "Rules: at most 30 words; do NOT describe his clothes (they are "
+        "fixed for the whole video and come from elsewhere); no camera "
+        "directions; no real brand names, logos or real people; do not "
+        "mention numbers or statistics; answer with the sentence only, "
+        "nothing else.\n\n"
         f"NARRATION: {narracao[:600]}\n"
         f"VISUAL NOTE: {visual[:300]}"
     )

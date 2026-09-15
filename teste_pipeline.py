@@ -303,10 +303,11 @@ def testar_broll_hibrido():
         gerados, _ = pipe.gerar_broll_ilustrado(plano, pasta, tema="t", roteiro=roteiro)
         checar("gera a ilustração do trecho específico", len(gerados) == 1, str(gerados))
         prompt_final = plano[2].get("prompt_imagem", "")
+        ficha_usada = pipe.gerar_ficha_de_personagem("t", roteiro)
         checar("prompt junta cena + ficha de personagem + estilo fixo",
                all(marca in prompt_final for marca in
-                   ("shop owner", "denim apron", "Minimalist webtoon-style")),
-               prompt_final[:120])
+                   ("shop owner", ficha_usada, pipe.ESTILO_IMAGEM_IA)),
+               prompt_final[:160])
 
         # provedor fora do ar: o trecho não pode ficar sem imagem
         plano2 = pipe.montar_plano_de_broll(roteiro)
@@ -319,6 +320,15 @@ def testar_broll_hibrido():
                gerados2 == [] and plano2[2]["fonte"] == "pexels"
                and plano2[2]["resultados_pexels"] != [],
                str(plano2[2]))
+
+        # O personagem tem que ser o MESMO em todas as cenas do vídeo -
+        # sem rosto pra reconhecer, a roupa é a única âncora que sobra.
+        fichas = {pipe.gerar_ficha_de_personagem("t", roteiro) for _ in range(3)}
+        checar("ficha de personagem é estável dentro do vídeo", len(fichas) == 1, str(fichas))
+        checar("ficha fixa não gasta chamada de LLM",
+               pipe.FICHA_PERSONAGEM_FIXA.strip() == "" or
+               pipe.gerar_ficha_de_personagem("outro tema", "outro roteiro")
+               == pipe.FICHA_PERSONAGEM_FIXA.strip())
 
         manifest = pipe.montar_manifest(plano, tema="t")
         checar("manifest tem um item por trecho, na ordem",
