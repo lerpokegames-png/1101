@@ -319,15 +319,23 @@ IMAGEM_IA_TIMEOUT_S = 180
 # um círculo sem rosto, não há traço facial pra reconhecer. O que varia de
 # cena pra cena é gesto, expressão, cenário e objetos, que é exatamente o
 # que descrever_cena_para_imagem() extrai do roteiro.
-FICHA_PERSONAGEM_FIXA = (
-    "the same recurring character in every scene: bald round head, dark "
-    "navy business suit, white dress shirt, thin dark tie, thin black "
-    "stick arms"
-)
+# Padrão: vazia - o personagem se veste conforme a história de cada vídeo.
+# Pra fixar um personagem só pro canal inteiro, escreva a descrição aqui,
+# por exemplo:
+#   FICHA_PERSONAGEM_FIXA = (
+#       "the same recurring character in every scene: bald round head, "
+#       "dark navy business suit, white dress shirt, thin dark tie"
+#   )
+FICHA_PERSONAGEM_FIXA = ""
 
-# Usada quando FICHA_PERSONAGEM_FIXA está vazia e o LLM não devolve uma
-# ficha aproveitável.
-FICHA_PERSONAGEM_PADRAO = FICHA_PERSONAGEM_FIXA
+# Rede de segurança pro caso de a ficha automática não sair (LLM fora do ar
+# ou resposta inutilizável). NÃO pode ser derivada de FICHA_PERSONAGEM_FIXA:
+# com ela vazia, o padrão também ficaria vazio e a imagem sairia sem
+# personagem nenhum - a descrição da cena viraria um cenário vazio.
+FICHA_PERSONAGEM_PADRAO = (
+    "the same recurring character in every scene: bald round head, plain "
+    "grey shirt, thin black stick arms"
+)
 
 # =========================================================================
 # PESQUISA DE FATOS (agente 0) - o que o roteirista lê antes de escrever

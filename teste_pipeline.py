@@ -325,10 +325,21 @@ def testar_broll_hibrido():
         # sem rosto pra reconhecer, a roupa é a única âncora que sobra.
         fichas = {pipe.gerar_ficha_de_personagem("t", roteiro) for _ in range(3)}
         checar("ficha de personagem é estável dentro do vídeo", len(fichas) == 1, str(fichas))
-        checar("ficha fixa não gasta chamada de LLM",
+        checar("ficha fixa, quando definida, vale pra todo vídeo",
                pipe.FICHA_PERSONAGEM_FIXA.strip() == "" or
                pipe.gerar_ficha_de_personagem("outro tema", "outro roteiro")
                == pipe.FICHA_PERSONAGEM_FIXA.strip())
+
+        # Com a ficha automática (o padrão), o personagem se veste conforme
+        # a história - mas se o LLM cair, a imagem não pode sair sem
+        # personagem nenhum.
+        def llm_fora(*a, **k):
+            raise ConnectionError("llm fora do ar")
+        pipe.chamar_llm = llm_fora
+        ficha_de_emergencia = pipe.gerar_ficha_de_personagem("t", roteiro)
+        checar("LLM fora do ar ainda entrega uma ficha utilizável",
+               len(ficha_de_emergencia) > 20 and "head" in ficha_de_emergencia,
+               repr(ficha_de_emergencia))
 
         manifest = pipe.montar_manifest(plano, tema="t")
         checar("manifest tem um item por trecho, na ordem",
