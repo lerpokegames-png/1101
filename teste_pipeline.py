@@ -24,6 +24,7 @@ objetivo é testar a mecânica, não produzir conteúdo sobre empresa real.
 import json
 import re
 import shutil
+import time
 import sys
 import tempfile
 import types
@@ -313,10 +314,11 @@ def testar_provedor_gemini():
         checar("formato recusado (400) faz tentar a variação seguinte",
                len(tentativas) == 3 and (pasta / "a.jpg").exists())
 
-        # 403/429/404 são chave, cota e modelo: insistir não resolve.
+        # 403, 404 e 429-por-DIA não melhoram insistindo.
         for codigo, texto, esperado in (
             (403, "billing not enabled", "faturamento"),
-            (429, "quota exceeded", "cota esgotada"),
+            (429, '{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}',
+             "cota diária"),
             (404, "model not found", "não existe"),
         ):
             chamadas = []
@@ -332,6 +334,27 @@ def testar_provedor_gemini():
                 mensagem = str(erro)
             checar(f"erro {codigo} explica a causa e não insiste",
                    esperado in mensagem and len(chamadas) == 1, mensagem[:90])
+
+        # 429 POR MINUTO é passageiro: espera o tempo sugerido e repete o
+        # MESMO pedido, em vez de perder a ilustração pro Pexels.
+        dormidas = []
+        pipe.time = types.SimpleNamespace(sleep=lambda s: dormidas.append(s))
+        tentativas_429 = []
+        def post_429_depois_ok(url, json=None, headers=None, timeout=None):
+            tentativas_429.append(json)
+            if len(tentativas_429) == 1:
+                return types.SimpleNamespace(
+                    status_code=429,
+                    text='{"quotaId":"GenerateRequestsPerMinute","retryDelay":"23s"}')
+            return resposta_ok()
+        pipe.requests = types.SimpleNamespace(post=post_429_depois_ok)
+        pipe.gerar_imagem_ia("prompt", pasta / "espera.jpg", 1)
+        checar("429 por minuto espera o tempo sugerido e repete",
+               len(tentativas_429) == 2 and dormidas and 23 <= dormidas[0] <= 26,
+               f"tentativas={len(tentativas_429)} dormidas={dormidas}")
+        checar("repete o MESMO formato de pedido, que não era o problema",
+               tentativas_429[0] == tentativas_429[1])
+        pipe.time = time
 
         # A folha de personagem vai como referência nas cenas seguintes.
         com_referencia = []

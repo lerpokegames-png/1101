@@ -118,6 +118,7 @@ YOUTUBE_API_KEY (gratuita):
 import os
 import re
 import json
+import time
 import unicodedata
 from pathlib import Path
 from datetime import datetime
@@ -308,7 +309,16 @@ HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "")
 # a mensagem diz exatamente qual é o motivo (chave, faturamento ou cota) e
 # o trecho cai pro Pexels.
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# Modelos de imagem que a chave enxerga hoje (confira com:
+#   curl "https://generativelanguage.googleapis.com/v1beta/models?key=SUA_CHAVE")
+#   gemini-2.5-flash-image        - mais barato/rápido
+#   gemini-3.1-flash-image        - geração mais nova
+#   gemini-3-pro-image            - melhor qualidade, gasta mais cota
 GEMINI_MODELO_IMAGEM = "gemini-2.5-flash-image"
+
+# Teto de espera quando a API pede pra repetir por limite POR MINUTO.
+# Acima disso não compensa segurar o pipeline - o trecho cai pro Pexels.
+GEMINI_ESPERA_MAXIMA_S = 65
 
 # Gera uma imagem do personagem no início do vídeo e usa como referência
 # nas cenas seguintes. Só tem efeito em provedor que aceita referência.
@@ -4269,6 +4279,19 @@ def _gerar_imagem_huggingface(prompt, caminho, semente, referencia=None):
     return caminho
 
 
+def _espera_sugerida_pelo_gemini(texto):
+    """
+    Quando recusa por taxa, a API manda junto um retryDelay ("23s") -
+    quase sempre é o limite POR MINUTO, não a cota do dia. Esperar esse
+    tempo e repetir salva a ilustração; desistir na hora joga o trecho pro
+    Pexels à toa. Devolve os segundos, ou None quando não há sugestão.
+    """
+    achado = re.search(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', texto or "")
+    if not achado:
+        return None
+    return float(achado.group(1))
+
+
 def _erro_amigavel_do_gemini(codigo, texto):
     """
     Traduz o erro da API do Google pra causa provável. Existe porque as
@@ -4279,9 +4302,14 @@ def _erro_amigavel_do_gemini(codigo, texto):
     """
     trecho = (texto or "")[:400]
     if codigo == 429:
-        return ("cota esgotada (limite por minuto ou por dia da chave). "
-                "Espere e tente de novo, ou reduza MAX_AI_IMAGES_PER_VIDEO. "
-                f"Resposta: {trecho}")
+        por_dia = "PerDay" in (texto or "")
+        alcance = "do DIA" if por_dia else "por minuto"
+        return (f"limite {alcance} da chave atingido. "
+                + ("A cota diária do free tier acabou - só volta amanhã, ou "
+                   "com faturamento ativado. "
+                   if por_dia else
+                   "É passageiro: o pipeline já espera e tenta de novo. ")
+                + f"Resposta: {trecho}")
     if codigo == 403:
         return ("chave sem permissão para este modelo. Em geral significa "
                 "que a geração de IMAGEM exige faturamento ativado no "
@@ -4365,7 +4393,12 @@ def _gerar_imagem_gemini(prompt, caminho, semente, referencia=None):
         f"{GEMINI_MODELO_IMAGEM}:generateContent?key={GEMINI_API_KEY}"
     )
     ultimo_erro = ""
-    for corpo in _corpos_do_pedido_gemini(prompt, referencia_b64, referencia_mime):
+    espera_ja_usada = False
+    corpos = _corpos_do_pedido_gemini(prompt, referencia_b64, referencia_mime)
+    indice = 0
+    while indice < len(corpos):
+        corpo = corpos[indice]
+        indice += 1
         resposta = requests.post(
             url,
             json=corpo,
@@ -4381,9 +4414,24 @@ def _gerar_imagem_gemini(prompt, caminho, semente, referencia=None):
                 arquivo.write(base64.b64decode(imagem_b64))
             return caminho
 
+        # 429 por MINUTO é passageiro: espera o tempo que a própria API
+        # sugeriu e repete o mesmo pedido, uma vez. Medido na prática: duas
+        # chamadas seguidas já bateram no limite, com retryDelay de 23s -
+        # perder a ilustração por causa disso seria desperdício.
+        if (resposta.status_code == 429
+                and not espera_ja_usada
+                and "PerDay" not in resposta.text):
+            espera = _espera_sugerida_pelo_gemini(resposta.text) or 20.0
+            espera = min(espera + 2, GEMINI_ESPERA_MAXIMA_S)
+            print(f"      (limite por minuto do Gemini - esperando {espera:.0f}s e repetindo)")
+            time.sleep(espera)
+            espera_ja_usada = True
+            indice -= 1  # repete o MESMO corpo, que não era o problema
+            continue
+
         # 400 costuma ser formato do pedido - vale tentar a próxima
-        # variação. 403/429/404 são de chave, cota ou modelo: insistir com
-        # outro formato não resolve nada e só gasta tempo.
+        # variação. 403/404 são de chave ou modelo, e 429 por DIA não
+        # melhora esperando: insistir não resolve nada e só gasta tempo.
         ultimo_erro = _erro_amigavel_do_gemini(resposta.status_code, resposta.text)
         if resposta.status_code != 400:
             raise RuntimeError(ultimo_erro)
