@@ -1,0 +1,10 @@
+# Chaves de API - NUNCA versionar
+.env
+
+# Saídas do pipeline (roteiros, áudio, clipes de b-roll)
+saidas/
+
+# Cache local
+.pronuncia_dict_cache.json
+__pycache__/
+*.pyc
