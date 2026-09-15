@@ -30,6 +30,17 @@ Pipeline de criação de roteiros para YouTube - nicho empresas/administração
    entre parágrafos (não é grátis - precisa de ELEVENLABS_API_KEY e
    ELEVENLABS_VOICE_ID no .env; sem isso, só pula essa etapa)
 
+TAMANHO DO ROTEIRO - por que a escrita é em blocos:
+    Pedindo o roteiro inteiro numa chamada, o modelo local devolveu 532 e
+    361 palavras em dois runs reais, contra o alvo de 1270-1620 - e o
+    passe de expansão, que existia pra corrigir isso, recuperou 9 e 1
+    palavra. Modelo pequeno não sustenta texto longo num turno só. Agora
+    são seis chamadas de 60 a 350 palavras cada (ESCREVER_POR_BLOCOS), com
+    o alvo pedido como TOPO da faixa e retentativa do bloco que vier
+    abaixo do mínimo. A contagem e a duração estimada aparecem a cada
+    bloco, então dá pra ver o roteiro crescendo em vez de descobrir no
+    fim que saiu curto.
+
 LOOP DE REVISÃO (roteirista <-> crítico) - por que ele termina:
     O loop já travou em roteiro bom por motivo que o roteirista não tinha
     como resolver. Quatro regras garantem que ele converge:
@@ -381,6 +392,14 @@ _CAMPOS_PROBLEMA_APRENDIZADO = (
 # sem alteração nenhuma, o único agente novo é o de tradução no final.
 # =========================================================================
 GERAR_EM_INGLES = True  # False = volta pro fluxo 100% em português direto
+
+# True = o roteiro é escrito em seis chamadas pequenas (uma por bloco) em
+# vez de uma grande. Medido em dois runs reais com qwen2.5:7b, a chamada
+# única devolveu 532 e 361 palavras contra um alvo de 1270-1620, e o passe
+# de expansão recuperou 9 e 1 palavra. Bloco de 300 palavras o modelo
+# entrega; roteiro inteiro, não. False volta pro comportamento antigo (faz
+# sentido com modelo grande na nuvem, que aguenta o texto todo de uma vez).
+ESCREVER_POR_BLOCOS = True
 
 # Canais de referência do nicho pra puxar inspiração dos vídeos que mais
 # renderam. Handles confirmados (conferidos por busca, não chutados):
@@ -2551,8 +2570,311 @@ def montar_checklist_verificar(conferencias, fontes):
 # AGENTE 2 - ROTEIRISTA
 # =========================================================================
 
+# =========================================================================
+# ESCRITA POR BLOCOS - como fazer um 7B entregar 1.400 palavras
+# =========================================================================
+# O problema medido em dois runs reais: pedindo o roteiro inteiro numa
+# chamada só, o modelo local devolveu 532 e depois 361 palavras, contra um
+# alvo de 1270-1620. O passe de expansão, que existia justamente pra isso,
+# ganhou 9 palavras num caso e 1 palavra no outro - ele não resolve, só
+# custa mais uma chamada lenta.
+#
+# A causa não é o prompt: é que modelo pequeno não sustenta texto longo
+# num único turno. Ele "conclui" cedo e para. A saída é trocar UMA tarefa
+# grande por VÁRIAS pequenas: 300 palavras por chamada é algo que um 7B
+# entrega com folga, e seis blocos de 300 somam o vídeo inteiro.
+#
+# Efeito colateral bom: o progresso fica visível. Em vez de esperar dez
+# minutos pra descobrir que saiu curto, aparece a contagem a cada bloco.
+
+PALAVRAS_POR_MINUTO_NARRACAO = 150  # ritmo de narração documental em PT-BR
+
+BLOCOS_DO_ROTEIRO = (
+    {
+        "nome": "INTRODUÇÃO",
+        "minimo": 60, "maximo": 90,
+        "pt": "Escreva a ABERTURA do vídeo. Comece com um número, uma "
+              "afirmação ou uma situação estranha. NÃO diga o nome da "
+              "empresa e NÃO entregue o final. Termine deixando uma "
+              "pergunta implícita no ar.",
+        "en": "Write the OPENING of the video. Start with a number, a "
+              "claim or a strange situation. Do NOT say the company name "
+              "and do NOT give away the ending. Close leaving an implicit "
+              "question hanging.",
+    },
+    {
+        "nome": "BACKSTORY",
+        "minimo": 280, "maximo": 350,
+        "pt": "Escreva o CONTEXTO da história, como se a pessoa não "
+              "soubesse nada do assunto: a época, o mercado, quem são os "
+              "envolvidos. Aqui o nome real da empresa APARECE. No meio "
+              "do bloco, encaixe um dado ou fato curioso que segure a "
+              "atenção.",
+        "en": "Write the BACKGROUND, as if the viewer knew nothing about "
+              "the subject: the period, the market, who is involved. The "
+              "real company name DOES appear here. Halfway through, drop "
+              "one fact or figure that holds attention.",
+    },
+    {
+        "nome": "MIOLO (1 de 3)",
+        "minimo": 250, "maximo": 320,
+        "pt": "Comece o DESENVOLVIMENTO: apresente a decisão ou o "
+              "conflito central e explique o raciocínio de gestão por "
+              "trás dele - o porquê, não só o fato. Encaixe uma revelação "
+              "ou dado novo neste bloco.",
+        "en": "Start the CORE: present the central decision or conflict "
+              "and explain the management reasoning behind it - the why, "
+              "not just the what. Land one new reveal or fact in this "
+              "block.",
+    },
+    {
+        "nome": "MIOLO (2 de 3)",
+        "minimo": 250, "maximo": 320,
+        "pt": "Continue o DESENVOLVIMENTO: as consequências da decisão e "
+              "como a situação evoluiu. Desenvolva cada etapa com "
+              "detalhe, sem resumir. Encaixe outra revelação ou dado novo.",
+        "en": "Continue the CORE: the consequences of that decision and "
+              "how the situation developed. Develop each step in detail, "
+              "do not summarize. Land another reveal or new fact.",
+    },
+    {
+        "nome": "MIOLO (3 de 3)",
+        "minimo": 250, "maximo": 320,
+        "pt": "Feche o DESENVOLVIMENTO: o desfecho do conflito e o que "
+              "ficou depois dele. Encaixe a última revelação antes da "
+              "conclusão.",
+        "en": "Close the CORE: how the conflict resolved and what was "
+              "left afterwards. Land the last reveal before the "
+              "conclusion.",
+    },
+    {
+        "nome": "CONCLUSÃO",
+        "minimo": 180, "maximo": 230,
+        "pt": "Escreva o FECHAMENTO. Se o assunto ainda está em "
+              "andamento, diga o que isso sinaliza pro futuro do setor; "
+              "se é caso encerrado, escreva a lição de gestão central. "
+              "Termine com uma frase de impacto, específica desta "
+              "história - nunca uma frase que caberia em qualquer vídeo.",
+        "en": "Write the ENDING. If the story is still unfolding, say "
+              "what it signals for the sector's future; if it is closed, "
+              "state the central management lesson. Finish with one "
+              "striking line specific to THIS story - never a line that "
+              "would fit any video.",
+    },
+)
+
+_REGRAS_COMPACTAS_PT = """REGRAS FIXAS (valem em todo bloco):
+- Formato obrigatório: cada frase vira uma linha "NARRAÇÃO:" seguida, na
+  LINHA SEGUINTE, de uma linha "VISUAL:" descrevendo a imagem de apoio.
+  Nunca junte as duas na mesma linha.
+- Marque [VERIFICAR] em todo número específico sobre a empresa real
+  (percentual, R$/US$, quantidade, data exata), a menos que seja fato
+  amplamente conhecido.
+- PROIBIDO inventar pessoa comum com nome próprio. Se precisar de uma
+  reação humana, descreva genericamente ("um gerente de loja notou que").
+- [ARQUIVO REAL] só pode aparecer numa linha VISUAL, nunca na narração.
+- PROIBIDO escrever na narração as palavras "mini-gancho", "bloco",
+  "passo", "backstory", "miolo" - são instruções, não texto narrado.
+- Frases curtas, linguagem falada. Primeira pessoa do plural quando
+  couber ("vamos aos números"), nunca do singular.
+- Responda SOMENTE com as linhas NARRAÇÃO:/VISUAL: deste bloco. Sem
+  título, sem comentário, sem repetir o que já foi escrito antes."""
+
+_REGRAS_COMPACTAS_EN = """FIXED RULES (apply to every block):
+- Mandatory format: each sentence becomes a "NARRAÇÃO:" line followed, on
+  the NEXT LINE, by a "VISUAL:" line describing the supporting image.
+  Never put both on the same line. Keep those two labels in Portuguese
+  exactly as written; the content itself stays in English.
+- Mark [VERIFICAR] on every specific number about the real company
+  (percentage, R$/US$, quantity, exact date) unless it is a widely known
+  fact.
+- FORBIDDEN to invent an ordinary person with a proper name. For a human
+  reaction, describe it generically ("a store manager noticed that").
+- [ARQUIVO REAL] may appear only on a VISUAL line, never in the narration.
+- FORBIDDEN to write the words "mini-gancho", "bloco", "passo",
+  "backstory", "miolo" in the narration - they are instructions, not
+  narrated text.
+- Short sentences, spoken language. First person plural where it fits
+  ("let's look at the numbers"), never first person singular.
+- Answer ONLY with this block's NARRAÇÃO:/VISUAL: lines. No heading, no
+  commentary, no repeating what was written before."""
+
+
+def estimar_duracao(palavras):
+    """Palavras de narração -> minutos aproximados de vídeo. É o número
+    que responde 'dá pra fazer um vídeo com isso?' antes de gastar
+    qualquer coisa nas etapas seguintes."""
+    if not palavras:
+        return "0min"
+    minutos = palavras / PALAVRAS_POR_MINUTO_NARRACAO
+    return f"{int(minutos)}min{int((minutos - int(minutos)) * 60):02d}s"
+
+
+def _resumo_do_que_ja_foi_escrito(roteiro_parcial, limite=1800):
+    """O bloco novo precisa saber onde a história parou - mas mandar o
+    roteiro inteiro a cada chamada faria o prompt crescer sem parar e
+    estourar o contexto no último bloco. Manda só o fim."""
+    if not roteiro_parcial:
+        return ""
+    if len(roteiro_parcial) <= limite:
+        return roteiro_parcial
+    return "[...início do roteiro omitido...]\n" + roteiro_parcial[-limite:]
+
+
+def _prompt_do_bloco(bloco, tema, roteiro_parcial, dossie_texto, tentativa_curta=0):
+    ingles = GERAR_EM_INGLES
+    regras = _REGRAS_COMPACTAS_EN if ingles else _REGRAS_COMPACTAS_PT
+    instrucao = bloco["en"] if ingles else bloco["pt"]
+    ja_escrito = _resumo_do_que_ja_foi_escrito(roteiro_parcial)
+
+    if ingles:
+        partes = [
+            f"You are writing ONE BLOCK of a YouTube documentary script "
+            f"(business/management niche).\n\nTOPIC: {tema}\n",
+            regras,
+            f"\nTHIS BLOCK - {bloco['nome']}:\n{instrucao}\n",
+            # Alvo declarado como o TOPO da faixa, não como faixa: pedindo
+            # "entre X e Y", o modelo ancora no piso e entrega X - com seis
+            # blocos assim o roteiro fecha abaixo do mínimo do vídeo.
+            f"LENGTH OF THIS BLOCK: aim for {bloco['maximo']} words of "
+            f"narration. Anything under {bloco['minimo']} words is too "
+            f"short and will be rejected. This is the whole task: do not "
+            f"try to write the rest of the video, only this block.",
+        ]
+        if ja_escrito:
+            partes.append(
+                f"\nWHAT WAS WRITTEN SO FAR (continue from here, do NOT "
+                f"repeat it):\n{ja_escrito}"
+            )
+        if dossie_texto:
+            partes.append(
+                f"\nRESEARCH DOSSIER (use only facts from here; anything "
+                f"not in it, leave out or write without numbers):\n{dossie_texto}"
+            )
+        if tentativa_curta:
+            partes.append(
+                f"\nATTENTION: your previous answer to this same block came "
+                f"back with only {tentativa_curta} words, well under the "
+                f"{bloco['minimo']} required. Write it again, longer, "
+                f"developing the same content with more detail and more "
+                f"sentences. Do not add new facts to pad it."
+            )
+    else:
+        partes = [
+            f"Você está escrevendo UM BLOCO de um roteiro de vídeo "
+            f"documental de YouTube (nicho empresas e administração).\n\n"
+            f"TEMA: {tema}\n",
+            regras,
+            f"\nESTE BLOCO - {bloco['nome']}:\n{instrucao}\n",
+            # Ver comentário na versão em inglês: alvo é o topo da faixa.
+            f"TAMANHO DESTE BLOCO: escreva perto de {bloco['maximo']} "
+            f"palavras de narração. Abaixo de {bloco['minimo']} palavras é "
+            f"curto demais e será rejeitado. Essa é a tarefa inteira: não "
+            f"tente escrever o resto do vídeo, só este bloco.",
+        ]
+        if ja_escrito:
+            partes.append(
+                f"\nO QUE JÁ FOI ESCRITO (continue daqui, NÃO repita):"
+                f"\n{ja_escrito}"
+            )
+        if dossie_texto:
+            partes.append(
+                f"\nDOSSIÊ DE PESQUISA (use só fatos daqui; o que não "
+                f"estiver nele, deixe de fora ou escreva sem número):"
+                f"\n{dossie_texto}"
+            )
+        if tentativa_curta:
+            partes.append(
+                f"\nATENÇÃO: sua resposta anterior pra este mesmo bloco "
+                f"veio com só {tentativa_curta} palavras, bem abaixo das "
+                f"{bloco['minimo']} necessárias. Escreva de novo, mais "
+                f"longo, desenvolvendo o mesmo conteúdo com mais detalhe e "
+                f"mais frases. Não invente fato novo pra encher."
+            )
+    return "\n".join(partes)
+
+
+def escrever_roteiro_por_blocos(tema, dossie=None):
+    """
+    Escreve o roteiro em seis chamadas pequenas em vez de uma grande.
+
+    Cada bloco tem alvo próprio (60 a 350 palavras), que é tamanho que
+    modelo pequeno entrega. Bloco que volta curto demais é refeito UMA
+    vez, com o número real na cara do modelo - a mesma mecânica do antigo
+    passe de expansão, só que sobre 300 palavras em vez de 1.300, que é a
+    diferença entre funcionar e não funcionar.
+
+    A contagem aparece a cada bloco: dá pra ver o roteiro crescendo em vez
+    de esperar o fim pra descobrir que saiu curto.
+    """
+    dossie_texto = texto_do_dossie(dossie, PESQUISA_MAX_CHARS_DOSSIE_CURTO) if dossie else ""
+    partes = []
+    total = 0
+    alvo_total = sum(b["minimo"] for b in BLOCOS_DO_ROTEIRO)
+
+    for numero, bloco in enumerate(BLOCOS_DO_ROTEIRO, 1):
+        roteiro_parcial = "\n".join(partes)
+        # max_tokens dimensionado pro bloco: ~2 tokens por palavra em
+        # PT-BR, mais folga pras linhas VISUAL.
+        teto_tokens = max(900, bloco["maximo"] * 4)
+
+        texto = chamar_llm(
+            _prompt_do_bloco(bloco, tema, roteiro_parcial, dossie_texto),
+            temperature=0.8,
+            max_tokens=teto_tokens,
+            avisar_corte=False,
+        )
+        palavras = contar_palavras_narracao(texto)
+
+        # Abaixo do mínimo do bloco, refaz - e não "abaixo de 70% do
+        # mínimo": com seis blocos entregando 80% cada, o roteiro fecha
+        # curto e a rodada inteira do crítico é desperdiçada. Uma chamada
+        # extra aqui é mais barata que uma tentativa inteira lá.
+        if palavras < bloco["minimo"]:
+            print(
+                f"    [{numero}/{len(BLOCOS_DO_ROTEIRO)}] {bloco['nome']}: "
+                f"{palavras} palavras (curto) - refazendo este bloco..."
+            )
+            texto_novo = chamar_llm(
+                _prompt_do_bloco(bloco, tema, roteiro_parcial, dossie_texto,
+                                 tentativa_curta=palavras),
+                temperature=0.8,
+                max_tokens=teto_tokens,
+                avisar_corte=False,
+            )
+            palavras_novo = contar_palavras_narracao(texto_novo)
+            if palavras_novo > palavras:
+                texto, palavras = texto_novo, palavras_novo
+
+        texto = texto.strip()
+        if texto:
+            partes.append(texto)
+        total += palavras
+        print(
+            f"    [{numero}/{len(BLOCOS_DO_ROTEIRO)}] {bloco['nome']}: "
+            f"+{palavras} palavras | total {total} "
+            f"(~{estimar_duracao(total)} de vídeo)"
+        )
+
+    roteiro = "\n".join(partes)
+    total_real = contar_palavras_narracao(roteiro)
+    print(
+        f"  Roteiro montado: {total_real} palavras de narração "
+        f"(~{estimar_duracao(total_real)} de vídeo; o alvo dos blocos "
+        f"somados é {alvo_total}+)."
+    )
+    return roteiro
+
+
 def escrever_roteiro(tema, roteiro_anterior=None, mudancas_obrigatorias=None,
                     historico_mudancas=None, dossie=None):
+    # Primeira escrita vai por blocos (ver comentário em
+    # escrever_roteiro_por_blocos). As REVISÕES continuam em chamada única:
+    # lá o modelo recebe um texto pronto pra corrigir, não precisa produzir
+    # 1.400 palavras do zero.
+    if roteiro_anterior is None and ESCREVER_POR_BLOCOS:
+        return escrever_roteiro_por_blocos(tema, dossie=dossie)
+
     template = ROTEIRO_PROMPT_EN if GERAR_EM_INGLES else ROTEIRO_PROMPT
     prompt = template.format(tema=tema)
     # Na primeira escrita o dossiê vai inteiro; numa revisão o prompt já
@@ -4314,7 +4636,25 @@ def gerar_video_completo(tema, max_tentativas=4, pesquisar=None):
         # SEGUNDA CORREÇÃO MECÂNICA: roteiro curto demais é expandido
         # ANTES da crítica, não depois. Um esqueleto de 300 palavras seria
         # reprovado nas 4 tentativas por motivos que só o tamanho causa.
-        roteiro = aplicar_expansao(roteiro, tema)
+        #
+        # Com escrita por blocos, o passe de expansão NÃO roda: medido em
+        # dois runs reais, ele recuperou 9 palavras num roteiro de 532 e 1
+        # palavra num de 361 - não resolve, e cada chamada dessas custa
+        # minutos. Quem garante o tamanho agora é a retentativa por bloco,
+        # que trabalha sobre 300 palavras em vez de 1.300.
+        if not ESCREVER_POR_BLOCOS:
+            roteiro = aplicar_expansao(roteiro, tema)
+        else:
+            palavras_agora = contar_palavras_narracao(roteiro)
+            if palavras_agora < MINIMO_PALAVRAS_PRA_AVALIAR:
+                print(
+                    f"    Aviso: {palavras_agora} palavras "
+                    f"(~{estimar_duracao(palavras_agora)}), abaixo do "
+                    f"mínimo de {MINIMO_PALAVRAS_PRA_AVALIAR}. O modelo "
+                    "local está rendendo pouco por bloco - se repetir, "
+                    "aumente os alvos em BLOCOS_DO_ROTEIRO ou ligue "
+                    "USAR_NUVEM."
+                )
         roteiro, numeros_pos_expansao = marcar_verificar_automatico(roteiro)
         if numeros_pos_expansao:
             print(f"    +{numeros_pos_expansao} número(s) marcados após a expansão.")

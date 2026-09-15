@@ -22,6 +22,7 @@ objetivo é testar a mecânica, não produzir conteúdo sobre empresa real.
 """
 
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -160,7 +161,67 @@ def testar_escolha_do_artigo():
 
 
 # =========================================================================
-# 5. FLUXO COMPLETO (pesquisa -> roteiro -> crítico -> tradução -> relatório)
+# 7. ESCRITA POR BLOCOS (o que faz um 7B entregar 1.400 palavras)
+# =========================================================================
+def _llm_que_entrega(fator):
+    """Dublê do modelo local: entrega uma fração do tamanho pedido. Um 7B
+    real rende perto de 85% do alvo por bloco; abaixo disso é modelo em
+    dificuldade."""
+    def responder(prompt, **kwargs):
+        alvo = re.search(r"perto de (\d+)", prompt)
+        palavras = int(int(alvo.group(1)) * fator) if alvo else 20
+        linhas, restante = [], palavras
+        while restante > 0:
+            n = min(18, restante)
+            restante -= n
+            linhas.append("NARRAÇÃO: " + " ".join(["palavra"] * n))
+            linhas.append("VISUAL: b-roll genérico de escritório")
+        return "\n".join(linhas)
+    return responder
+
+
+def testar_escrita_por_blocos():
+    print("\n7. Escrita por blocos")
+    original = {"llm": pipe.chamar_llm, "ingles": pipe.GERAR_EM_INGLES}
+    pipe.GERAR_EM_INGLES = False
+    try:
+        pipe.chamar_llm = _llm_que_entrega(0.85)
+        roteiro = pipe.escrever_roteiro_por_blocos("tema de teste")
+        total = pipe.contar_palavras_narracao(roteiro)
+        checar("roteiro fecha dentro do alvo do canal (1270-1620)",
+               1270 <= total <= 1620, f"{total} palavras")
+        checar("formato NARRAÇÃO/VISUAL preservado em todos os blocos",
+               roteiro.count("NARRAÇÃO:") == roteiro.count("VISUAL:")
+               and roteiro.count("NARRAÇÃO:") > 20)
+        checar("duração estimada bate com a contagem",
+               pipe.estimar_duracao(1500).startswith("10min"),
+               pipe.estimar_duracao(1500))
+
+        # O alvo tem que ser pedido como TOPO da faixa: pedindo "entre X e
+        # Y" o modelo ancora no piso e seis blocos fecham abaixo do mínimo.
+        prompt = pipe._prompt_do_bloco(
+            pipe.BLOCOS_DO_ROTEIRO[1], "tema", "", "")
+        checar("o prompt do bloco pede o topo da faixa, não a faixa",
+               "perto de 350" in prompt and "Abaixo de 280" in prompt,
+               prompt[-200:])
+
+        chamadas = {"n": 0}
+        base = _llm_que_entrega(0.5)
+        def contar(prompt, **kwargs):
+            chamadas["n"] += 1
+            return base(prompt, **kwargs)
+        pipe.chamar_llm = contar
+        pipe.escrever_roteiro_por_blocos("tema")
+        checar("bloco abaixo do mínimo é refeito uma vez",
+               chamadas["n"] == 2 * len(pipe.BLOCOS_DO_ROTEIRO),
+               f"{chamadas['n']} chamadas")
+    finally:
+        pipe.chamar_llm = original["llm"]
+        pipe.GERAR_EM_INGLES = original["ingles"]
+
+
+# =========================================================================
+# 8. FLUXO COMPLETO (pesquisa -> roteiro -> crítico -> tradução -> relatório)
 # =========================================================================
 ARTIGO_FALSO = """NorteSul Logística é uma transportadora fictícia fundada em 2004.
 
@@ -356,7 +417,7 @@ def testar_broll_hibrido():
 
 
 def testar_fluxo_completo():
-    print("\n7. Fluxo completo do vídeo")
+    print("\n8. Fluxo completo do vídeo")
     pasta = Path(tempfile.mkdtemp(prefix="ensaio_pipeline_"))
     original = {
         "requests": pipe.requests,
@@ -502,6 +563,7 @@ if __name__ == "__main__":
     testar_leitura_do_critico()
     testar_escolha_do_artigo()
     testar_broll_hibrido()
+    testar_escrita_por_blocos()
     testar_fluxo_completo()
     print("\n" + "=" * 70)
     if FALHAS:
