@@ -109,7 +109,26 @@ def testar_leitura_do_critico():
 
 
 # =========================================================================
-# 4. FLUXO COMPLETO (pesquisa -> roteiro -> crítico -> tradução -> relatório)
+# 4. ESCOLHA DO ARTIGO CERTO NA WIKIPÉDIA
+# =========================================================================
+def testar_escolha_do_artigo():
+    print("\n4. Escolha do artigo certo na Wikipédia")
+    for titulo, intro, desambig, esperado in [
+        ("NorteSul (desambiguação)", "NorteSul pode referir-se a:", True, None),
+        ("Lista de transportadoras", "Esta é uma lista.", False, None),
+        ("NorteSul (rio)", "Curso d'água de 40 quilômetros.", False, 0),
+    ]:
+        nota = pipe._pontuar_candidato(titulo, "NorteSul Logística", intro, desambig)
+        checar(f"descarta/rebaixa '{titulo}'", nota == esperado, f"nota={nota}")
+    nota_empresa = pipe._pontuar_candidato(
+        "NorteSul Logística", "NorteSul Logística",
+        "NorteSul Logística é uma empresa transportadora fundada em 2004, sediada em MG.",
+        False)
+    checar("artigo da empresa ganha de todos", (nota_empresa or 0) > 10, f"nota={nota_empresa}")
+
+
+# =========================================================================
+# 5. FLUXO COMPLETO (pesquisa -> roteiro -> crítico -> tradução -> relatório)
 # =========================================================================
 ARTIGO_FALSO = """NorteSul Logística é uma transportadora fictícia fundada em 2004.
 
@@ -126,8 +145,30 @@ Em 2016 uma falha no sistema de roteirização atrasou 30% das entregas do trime
 Site oficial. Categoria: empresas fictícias.
 """
 
+# A busca devolve 4 candidatos de propósito: uma desambiguação, uma lista,
+# a empresa e um homônimo. Só a empresa pode ser escolhida.
 RESPOSTAS_HTTP = {
-    ("query", "search"): {"query": {"search": [{"title": "NorteSul Logística"}]}},
+    ("query", "search"): {"query": {"search": [
+        {"title": "NorteSul (desambiguação)"},
+        {"title": "Lista de transportadoras do Brasil"},
+        {"title": "NorteSul Logística"},
+        {"title": "NorteSul (rio)"},
+    ]}},
+    ("query", "previa"): {"query": {"pages": {
+        "1": {"title": "NorteSul (desambiguação)",
+              "extract": "NorteSul pode referir-se a:",
+              "pageprops": {"disambiguation": ""}},
+        "2": {"title": "Lista de transportadoras do Brasil",
+              "extract": "Esta é uma lista de transportadoras.", "pageprops": {}},
+        "3": {"title": "NorteSul Logística",
+              "extract": ("NorteSul Logística é uma empresa transportadora "
+                          "fictícia fundada em 2004, sediada em Minas Gerais, "
+                          "com operação em nove estados do país."),
+              "pageprops": {"wikibase_item": "Q999999"}},
+        "4": {"title": "NorteSul (rio)",
+              "extract": "Curso d'água de 40 quilômetros.",
+              "pageprops": {"wikibase_item": "Q555"}},
+    }}},
     ("query", "extracts"): {"query": {"pages": {"1": {
         "title": "NorteSul Logística", "extract": ARTIGO_FALSO}}}},
     ("wbsearchentities", None): {"search": [{"id": "Q999999"}]},
@@ -184,7 +225,7 @@ def _avaliacao(mudancas, veredito, evento="Nenhum encontrado"):
 
 
 def testar_fluxo_completo():
-    print("\n4. Fluxo completo do vídeo")
+    print("\n5. Fluxo completo do vídeo")
     pasta = Path(tempfile.mkdtemp(prefix="ensaio_pipeline_"))
     original = {
         "requests": pipe.requests,
@@ -212,11 +253,20 @@ def testar_fluxo_completo():
     def get_falso(url, params=None, headers=None, timeout=None):
         acao = params.get("action")
         if acao == "query":
-            chave = ("query", "search" if params.get("list") == "search" else "extracts")
+            if params.get("list") == "search":
+                chave = ("query", "search")
+            elif "pageprops" in params.get("prop", ""):
+                chave = ("query", "previa")
+            else:
+                chave = ("query", "extracts")
         elif acao == "wbgetentities":
             chave = ("wbgetentities",
                      "claims" if "claims" in params.get("props", "") else "labels")
         else:
+            # Tendo o wikibase_item do artigo, o Wikidata NÃO pode mais ser
+            # procurado por nome - é aí que ele cai noutra entidade.
+            if acao == "wbsearchentities":
+                FALHAS.append("buscou no Wikidata por nome tendo o qid do artigo")
             chave = (acao, None)
         return RespostaFalsa(RESPOSTAS_HTTP[chave])
 
@@ -262,6 +312,12 @@ def testar_fluxo_completo():
                    for marca in ("WIKIPÉDIA", "FATOS ESTRUTURADOS", "MANCHETES")))
         checar("seção irrelevante ficou fora do dossiê",
                "Ligações externas" not in resultado["dossie"]["texto"])
+        checar("escolheu o artigo da empresa, não a desambiguação nem a lista",
+               "WIKIPÉDIA - NorteSul Logística" in resultado["dossie"]["texto"],
+               resultado["dossie"]["texto"][:200])
+        checar("usou o ID do Wikidata que veio do próprio artigo",
+               "Q999999" in " ".join(resultado["dossie"]["fontes"]),
+               str(resultado["dossie"]["fontes"]))
         conferencias = pipe.conferir_numeros_contra_dossie(
             resultado["roteiro"], resultado["dossie"])
         por_trecho = {c["trecho"]: c["confere"] for c in conferencias}
@@ -302,6 +358,7 @@ if __name__ == "__main__":
     testar_marcacao()
     testar_filtro()
     testar_leitura_do_critico()
+    testar_escolha_do_artigo()
     testar_fluxo_completo()
     print("\n" + "=" * 70)
     if FALHAS:

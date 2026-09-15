@@ -1837,42 +1837,123 @@ def _resumir_artigo(texto, limite):
     return "\n\n".join(partes)
 
 
+# Sinais de que o artigo encontrado é mesmo de uma organização, e não de
+# uma cidade, um filme ou uma pessoa com nome parecido.
+_SINAIS_DE_EMPRESA = (
+    "empresa", "companhia", "corporação", "corporacao", "multinacional",
+    "conglomerado", "holding", "startup", "s.a.", "s/a", "ltda", "banco",
+    "varejista", "fabricante", "operadora", "transportadora", "fundada",
+    "fundado", "sediada", "company", "corporation", "founded",
+    "headquartered", "inc.", "manufacturer", "retailer",
+)
+
+
+def _pontuar_candidato(titulo, termo, intro, e_desambiguacao):
+    """
+    Nota de um artigo candidato (maior = melhor). Devolve None pro que
+    deve ser descartado de saída.
+
+    Existe porque pegar o primeiro resultado da busca é um chute: "Ambev"
+    acha a empresa, mas um termo mais genérico cai fácil numa página de
+    desambiguação, numa lista ou no artigo da cidade de mesmo nome - e aí
+    o dossiê inteiro fica sobre o assunto errado, que é pior do que não
+    ter dossiê nenhum (o roteirista confia no material).
+    """
+    if e_desambiguacao:
+        return None
+    titulo_n = _normalizar_para_comparar(titulo)
+    termo_n = _normalizar_para_comparar(termo)
+    intro_n = _normalizar_para_comparar(intro)
+    if titulo_n.startswith("lista de") or titulo_n.startswith("anexo"):
+        return None
+    # "X pode referir-se a" é desambiguação sem a marca formal.
+    if "pode referir se a" in intro_n[:200] or "may refer to" in intro_n[:200]:
+        return None
+
+    nota = 0
+    if titulo_n == termo_n:
+        nota += 10
+    elif termo_n in titulo_n or titulo_n in termo_n:
+        nota += 5
+    nota += 3 * sum(1 for sinal in _SINAIS_DE_EMPRESA
+                    if sinal in intro_n[:600])
+    if len(intro) > 300:
+        nota += 1
+    return nota
+
+
 def buscar_wikipedia(termo, idioma="pt", limite_caracteres=3500):
     """
-    Busca o artigo e devolve {titulo, url, texto} ou None.
+    Acha o artigo certo e devolve {titulo, url, texto, qid} ou None.
 
-    Duas chamadas: uma pra achar o título certo (busca por texto livre) e
-    outra pro conteúdo. Não usa chave de API.
+    Três chamadas à API aberta da MediaWiki (sem chave, sem registro):
+      1. list=search - até 5 candidatos, em vez de aceitar o primeiro;
+      2. prop=extracts|pageprops (só a introdução, exlimit=5) - texto pra
+         escolher entre eles, a marca de página de desambiguação e o
+         wikibase_item, que é o ID EXATO desse artigo no Wikidata;
+      3. prop=extracts do vencedor - o artigo inteiro.
+
+    O qid da chamada 2 é o que evita o segundo chute: sem ele, a busca no
+    Wikidata é por nome e pode cair noutra entidade com nome parecido.
     """
     base = f"https://{idioma}.wikipedia.org/w/api.php"
     busca = _pesquisa_get(base, {
         "action": "query", "list": "search", "srsearch": termo,
-        "srlimit": 1, "format": "json",
+        "srlimit": 5, "format": "json",
     })
     if not busca:
         return None
-    resultados = busca.get("query", {}).get("search", [])
-    if not resultados:
+    candidatos = [r["title"] for r in busca.get("query", {}).get("search", [])]
+    if not candidatos:
         return None
-    titulo = resultados[0]["title"]
+
+    previa = _pesquisa_get(base, {
+        "action": "query", "prop": "extracts|pageprops",
+        "ppprop": "disambiguation|wikibase_item",
+        "exintro": 1, "explaintext": 1, "exlimit": len(candidatos),
+        "redirects": 1, "titles": "|".join(candidatos), "format": "json",
+    })
+    paginas = (previa or {}).get("query", {}).get("pages", {})
+
+    melhor = None
+    for pagina in paginas.values():
+        titulo = pagina.get("title", "")
+        props = pagina.get("pageprops", {})
+        nota = _pontuar_candidato(
+            titulo, termo, pagina.get("extract", "") or "",
+            "disambiguation" in props,
+        )
+        if nota is None:
+            continue
+        if melhor is None or nota > melhor["nota"]:
+            melhor = {"nota": nota, "titulo": titulo,
+                      "qid": props.get("wikibase_item")}
+
+    # Nenhum candidato prestou (todos desambiguação/lista) ou a prévia não
+    # veio: cai no primeiro resultado da busca, que é o comportamento
+    # antigo - pior escolha, mas melhor que desistir.
+    titulo_escolhido = melhor["titulo"] if melhor else candidatos[0]
+    qid = melhor["qid"] if melhor else None
 
     conteudo = _pesquisa_get(base, {
         "action": "query", "prop": "extracts", "explaintext": 1,
-        "exsectionformat": "plain", "redirects": 1, "titles": titulo,
-        "format": "json",
+        "exsectionformat": "plain", "redirects": 1,
+        "titles": titulo_escolhido, "format": "json",
     })
     if not conteudo:
         return None
-    paginas = conteudo.get("query", {}).get("pages", {})
-    for pagina in paginas.values():
+    for pagina in conteudo.get("query", {}).get("pages", {}).values():
         texto = pagina.get("extract", "")
         if not texto:
             continue
+        titulo_final = pagina.get("title", titulo_escolhido)
         return {
-            "titulo": pagina.get("title", titulo),
+            "titulo": titulo_final,
             "url": f"https://{idioma}.wikipedia.org/wiki/"
-                   + pagina.get("title", titulo).replace(" ", "_"),
+                   + titulo_final.replace(" ", "_"),
             "texto": _resumir_artigo(texto, limite_caracteres),
+            "qid": qid,
+            "candidatos": candidatos,
         }
     return None
 
@@ -1930,19 +2011,26 @@ def _ano_da_claim(claim):
     return None
 
 
-def buscar_wikidata(termo, idioma="pt"):
+def buscar_wikidata(termo, idioma="pt", qid=None):
     """
     Fatos estruturados (fundação, sede, fundador, funcionários, receita).
     Devolve lista de strings prontas pro dossiê. Vale a pena porque aqui
     o número vem com unidade e ano, não da memória do modelo.
+
+    Quando o artigo da Wikipédia já entregou o wikibase_item (qid), usa
+    ele direto: é o MESMO assunto do artigo, sem risco de a busca por
+    nome cair noutra entidade parecida. A busca por nome fica só como
+    plano B.
     """
-    busca = _pesquisa_get("https://www.wikidata.org/w/api.php", {
-        "action": "wbsearchentities", "search": termo, "language": idioma,
-        "uselang": idioma, "limit": 1, "format": "json",
-    })
-    if not busca or not busca.get("search"):
-        return [], None
-    entidade_id = busca["search"][0]["id"]
+    entidade_id = qid
+    if not entidade_id:
+        busca = _pesquisa_get("https://www.wikidata.org/w/api.php", {
+            "action": "wbsearchentities", "search": termo, "language": idioma,
+            "uselang": idioma, "limit": 1, "format": "json",
+        })
+        if not busca or not busca.get("search"):
+            return [], None
+        entidade_id = busca["search"][0]["id"]
 
     dados = _pesquisa_get("https://www.wikidata.org/w/api.php", {
         "action": "wbgetentities", "ids": entidade_id, "props": "claims",
@@ -2144,11 +2232,18 @@ def pesquisar_dossie(tema, usar_cache=True):
         # Artigo em inglês costuma ser mais completo pra empresa de fora.
         artigo = buscar_wikipedia(termos[0], idioma="en")
     if artigo:
-        print(f"  Wikipédia: {artigo['titulo']} ({len(artigo['texto'])} caracteres)")
+        outros = [c for c in artigo.get("candidatos", []) if c != artigo["titulo"]]
+        print(
+            f"  Wikipédia: {artigo['titulo']} ({len(artigo['texto'])} caracteres)"
+            + (f" - escolhido entre {len(artigo['candidatos'])} candidatos; "
+               f"os outros eram: {', '.join(outros[:4])}" if outros else "")
+        )
         fontes.append(artigo["url"])
         blocos.append(f"=== WIKIPÉDIA - {artigo['titulo']} ===\n{artigo['texto']}")
 
-    fatos, url_wikidata = buscar_wikidata(entidade or termos[0])
+    fatos, url_wikidata = buscar_wikidata(
+        entidade or termos[0], qid=(artigo or {}).get("qid")
+    )
     if fatos:
         print(f"  Wikidata: {len(fatos)} fato(s) estruturado(s)")
         if url_wikidata:
