@@ -277,7 +277,97 @@ def testar_roteamento_por_agente():
 
 
 # =========================================================================
-# 9. FLUXO COMPLETO (pesquisa -> roteiro -> crítico -> tradução -> relatório)
+# 9. GEMINI: REFERÊNCIA DE IMAGEM E MOTIVO DA RECUSA
+# =========================================================================
+def testar_provedor_gemini():
+    print("\n9. Gemini (imagem de referência e erros)")
+    import base64
+    original = {"provedor": pipe.PROVEDOR_IMAGEM, "chave": pipe.GEMINI_API_KEY,
+                "requests": pipe.requests, "llm": pipe.chamar_llm,
+                "traduz": pipe.traduzir_termo_busca,
+                "busca": pipe.buscar_broll_com_alternativas}
+    pasta = Path(tempfile.mkdtemp(prefix="gemini_teste_"))
+    imagem_b64 = base64.b64encode(b"\xff\xd8\xff" + b"0" * 2000).decode()
+
+    def resposta_ok():
+        return types.SimpleNamespace(
+            status_code=200, text="",
+            json=lambda: {"candidates": [{"content": {"parts": [
+                {"inlineData": {"data": imagem_b64}}]}}]})
+    try:
+        pipe.PROVEDOR_IMAGEM = "gemini"
+        pipe.GEMINI_API_KEY = "chave-de-teste"
+        checar("gemini é reconhecido como provedor com referência",
+               pipe.provedor_aceita_referencia())
+
+        # 400 é formato do pedido: vale tentar outra variação do corpo.
+        tentativas = []
+        def post_400_depois_ok(url, json=None, headers=None, timeout=None):
+            tentativas.append(json)
+            if len(tentativas) < 3:
+                return types.SimpleNamespace(status_code=400,
+                                             text="Unknown name imageConfig")
+            return resposta_ok()
+        pipe.requests = types.SimpleNamespace(post=post_400_depois_ok)
+        pipe.gerar_imagem_ia("prompt", pasta / "a.jpg", 1)
+        checar("formato recusado (400) faz tentar a variação seguinte",
+               len(tentativas) == 3 and (pasta / "a.jpg").exists())
+
+        # 403/429/404 são chave, cota e modelo: insistir não resolve.
+        for codigo, texto, esperado in (
+            (403, "billing not enabled", "faturamento"),
+            (429, "quota exceeded", "cota esgotada"),
+            (404, "model not found", "não existe"),
+        ):
+            chamadas = []
+            def post_erro(url, json=None, headers=None, timeout=None,
+                          _c=codigo, _t=texto):
+                chamadas.append(1)
+                return types.SimpleNamespace(status_code=_c, text=_t)
+            pipe.requests = types.SimpleNamespace(post=post_erro)
+            try:
+                pipe.gerar_imagem_ia("prompt", pasta / "x.jpg", 1)
+                mensagem = ""
+            except RuntimeError as erro:
+                mensagem = str(erro)
+            checar(f"erro {codigo} explica a causa e não insiste",
+                   esperado in mensagem and len(chamadas) == 1, mensagem[:90])
+
+        # A folha de personagem vai como referência nas cenas seguintes.
+        com_referencia = []
+        def post_captura(url, json=None, headers=None, timeout=None):
+            partes = json["contents"][0]["parts"]
+            com_referencia.append(any("inline_data" in p for p in partes))
+            return resposta_ok()
+        pipe.requests = types.SimpleNamespace(post=post_captura)
+        pipe.chamar_llm = lambda prompt, **k: (
+            "bald character in a navy suit" if "recurring character" in prompt
+            else "character pointing at a chart, focused, in an office")
+        pipe.traduzir_termo_busca = lambda t: "office"
+        pipe.buscar_broll_com_alternativas = lambda en, pt: []
+        roteiro = ("NARRAÇÃO: O diretor aponta o gráfico na reunião.\n"
+                   "VISUAL: [ARQUIVO REAL] o diretor apontando o gráfico")
+        plano = pipe.montar_plano_de_broll(roteiro)
+        pasta_video = Path(tempfile.mkdtemp())
+        pipe.gerar_broll_ilustrado(plano, pasta_video, tema="t", roteiro=roteiro)
+        checar("folha de personagem é gerada uma vez",
+               (pasta_video / "00_folha_personagem.jpg").exists())
+        checar("a folha vai sem referência; as cenas vão com ela",
+               com_referencia and com_referencia[0] is False
+               and all(com_referencia[1:]), str(com_referencia))
+        shutil.rmtree(pasta_video, ignore_errors=True)
+    finally:
+        pipe.PROVEDOR_IMAGEM = original["provedor"]
+        pipe.GEMINI_API_KEY = original["chave"]
+        pipe.requests = original["requests"]
+        pipe.chamar_llm = original["llm"]
+        pipe.traduzir_termo_busca = original["traduz"]
+        pipe.buscar_broll_com_alternativas = original["busca"]
+        shutil.rmtree(pasta, ignore_errors=True)
+
+
+# =========================================================================
+# 10. FLUXO COMPLETO (pesquisa -> roteiro -> crítico -> tradução -> relatório)
 # =========================================================================
 ARTIGO_FALSO = """NorteSul Logística é uma transportadora fictícia fundada em 2004.
 
@@ -473,7 +563,7 @@ def testar_broll_hibrido():
 
 
 def testar_fluxo_completo():
-    print("\n9. Fluxo completo do vídeo")
+    print("\n10. Fluxo completo do vídeo")
     pasta = Path(tempfile.mkdtemp(prefix="ensaio_pipeline_"))
     original = {
         "requests": pipe.requests,
@@ -622,6 +712,7 @@ if __name__ == "__main__":
     testar_broll_hibrido()
     testar_escrita_por_blocos()
     testar_roteamento_por_agente()
+    testar_provedor_gemini()
     testar_fluxo_completo()
     print("\n" + "=" * 70)
     if FALHAS:

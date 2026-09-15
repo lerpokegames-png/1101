@@ -298,6 +298,22 @@ POLLINATIONS_MODELO = "flux"
 HUGGINGFACE_MODELO_IMAGEM = "black-forest-labs/FLUX.1-schnell"
 HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "")
 
+# Gemini (Google AI Studio) - chave em https://aistudio.google.com/apikey
+# É o único provedor aqui que aceita IMAGEM de referência, o que permite
+# manter o mesmo personagem de verdade entre as cenas, e não só por
+# descrição escrita.
+# ATENÇÃO À COBRANÇA: a camada gratuita do AI Studio cobre modelos de
+# TEXTO; geração de IMAGEM costuma exigir faturamento ativado no projeto,
+# e isso muda de tempos em tempos. O código não chuta: se a API recusar,
+# a mensagem diz exatamente qual é o motivo (chave, faturamento ou cota) e
+# o trecho cai pro Pexels.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODELO_IMAGEM = "gemini-2.5-flash-image"
+
+# Gera uma imagem do personagem no início do vídeo e usa como referência
+# nas cenas seguintes. Só tem efeito em provedor que aceita referência.
+USAR_FOLHA_DE_PERSONAGEM = True
+
 # Teto de imagens por vídeo. Com provedor gratuito o custo é tempo e
 # limite de uso, não dinheiro - mas o teto continua valendo pra não
 # transformar um vídeo inteiro em slideshow de imagem parada.
@@ -4205,7 +4221,7 @@ def montar_prompt_de_imagem(descricao_cena, ficha_personagem):
 # Clientes de geração de imagem
 # -------------------------------------------------------------------------
 
-def _gerar_imagem_pollinations(prompt, caminho, semente):
+def _gerar_imagem_pollinations(prompt, caminho, semente, referencia=None):
     """
     Pollinations: gratuito e SEM CHAVE de API - por isso é o padrão aqui.
     A imagem vem direto na resposta de um GET.
@@ -4231,7 +4247,7 @@ def _gerar_imagem_pollinations(prompt, caminho, semente):
     return caminho
 
 
-def _gerar_imagem_huggingface(prompt, caminho, semente):
+def _gerar_imagem_huggingface(prompt, caminho, semente, referencia=None):
     """
     Hugging Face Inference API: gratuito com token (também grátis), mas
     com fila e limite por hora. Alternativa pra quando o Pollinations
@@ -4253,20 +4269,179 @@ def _gerar_imagem_huggingface(prompt, caminho, semente):
     return caminho
 
 
+def _erro_amigavel_do_gemini(codigo, texto):
+    """
+    Traduz o erro da API do Google pra causa provável. Existe porque as
+    três falhas mais comuns aqui (chave errada, faturamento desligado,
+    cota do free tier estourada) chegam como números parecidos e mensagem
+    em inglês - e a diferença entre elas muda completamente o que você
+    tem que fazer.
+    """
+    trecho = (texto or "")[:400]
+    if codigo == 429:
+        return ("cota esgotada (limite por minuto ou por dia da chave). "
+                "Espere e tente de novo, ou reduza MAX_AI_IMAGES_PER_VIDEO. "
+                f"Resposta: {trecho}")
+    if codigo == 403:
+        return ("chave sem permissão para este modelo. Em geral significa "
+                "que a geração de IMAGEM exige faturamento ativado no "
+                "projeto, mesmo quando os modelos de texto são gratuitos. "
+                f"Resposta: {trecho}")
+    if codigo == 400 and "API key not valid" in trecho:
+        return f"GEMINI_API_KEY inválida. Resposta: {trecho}"
+    if codigo == 404:
+        return (f"modelo '{GEMINI_MODELO_IMAGEM}' não existe ou não está "
+                "disponível para esta chave - confira o nome atual em "
+                f"GEMINI_MODELO_IMAGEM. Resposta: {trecho}")
+    return f"HTTP {codigo}: {trecho}"
+
+
+def _corpos_do_pedido_gemini(prompt, referencia_b64, referencia_mime):
+    """
+    Variações do corpo do pedido, da mais completa pra mais simples.
+
+    O formato aceito pelos modelos de imagem do Gemini mudou mais de uma
+    vez (responseModalities só IMAGE, TEXT+IMAGE, imageConfig com
+    aspectRatio). Em vez de apostar numa forma só e quebrar quando o
+    Google mexer, tenta em ordem e fica com a primeira que a API aceitar.
+    """
+    partes = [{"text": prompt}]
+    if referencia_b64:
+        partes.append({
+            "inline_data": {"mime_type": referencia_mime, "data": referencia_b64}
+        })
+    conteudo = [{"parts": partes}]
+    return [
+        {"contents": conteudo, "generationConfig": {
+            "responseModalities": ["IMAGE"],
+            "imageConfig": {"aspectRatio": "16:9"}}},
+        {"contents": conteudo, "generationConfig": {
+            "responseModalities": ["IMAGE"]}},
+        {"contents": conteudo, "generationConfig": {
+            "responseModalities": ["TEXT", "IMAGE"]}},
+        {"contents": conteudo},
+    ]
+
+
+def _extrair_imagem_do_gemini(dados):
+    """A imagem vem em base64 dentro de uma das partes da resposta."""
+    for candidato in dados.get("candidates", []):
+        for parte in candidato.get("content", {}).get("parts", []):
+            embutido = parte.get("inlineData") or parte.get("inline_data") or {}
+            if embutido.get("data"):
+                return embutido["data"]
+    return None
+
+
+def _gerar_imagem_gemini(prompt, caminho, semente, referencia=None):
+    """
+    Gemini (Google AI Studio). É o único provedor aqui que aceita IMAGEM
+    DE REFERÊNCIA - dá pra mandar a folha de personagem junto e pedir "o
+    mesmo personagem, nesta outra cena", que é bem mais forte do que
+    descrever a roupa por escrito.
+
+    SOBRE SER GRÁTIS: a chave do AI Studio tem camada gratuita para
+    modelos de TEXTO, mas geração de IMAGEM historicamente exige
+    faturamento ativado no projeto. Isso muda com frequência - em vez de
+    chutar, este código devolve o motivo exato da recusa (ver
+    _erro_amigavel_do_gemini), e o trecho cai pro Pexels sozinho.
+    """
+    import base64
+
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY não configurada no .env")
+
+    referencia_b64 = None
+    referencia_mime = "image/jpeg"
+    if referencia:
+        caminho_ref = Path(referencia)
+        if caminho_ref.exists():
+            referencia_b64 = base64.b64encode(caminho_ref.read_bytes()).decode("ascii")
+            if caminho_ref.suffix.lower() == ".png":
+                referencia_mime = "image/png"
+
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODELO_IMAGEM}:generateContent?key={GEMINI_API_KEY}"
+    )
+    ultimo_erro = ""
+    for corpo in _corpos_do_pedido_gemini(prompt, referencia_b64, referencia_mime):
+        resposta = requests.post(
+            url,
+            json=corpo,
+            headers={"Content-Type": "application/json"},
+            timeout=IMAGEM_IA_TIMEOUT_S,
+        )
+        if resposta.status_code == 200:
+            imagem_b64 = _extrair_imagem_do_gemini(resposta.json())
+            if not imagem_b64:
+                ultimo_erro = "a resposta veio sem imagem (só texto)"
+                continue
+            with open(caminho, "wb") as arquivo:
+                arquivo.write(base64.b64decode(imagem_b64))
+            return caminho
+
+        # 400 costuma ser formato do pedido - vale tentar a próxima
+        # variação. 403/429/404 são de chave, cota ou modelo: insistir com
+        # outro formato não resolve nada e só gasta tempo.
+        ultimo_erro = _erro_amigavel_do_gemini(resposta.status_code, resposta.text)
+        if resposta.status_code != 400:
+            raise RuntimeError(ultimo_erro)
+
+    raise RuntimeError(ultimo_erro or "a API do Gemini não aceitou nenhum formato de pedido")
+
+
+def gerar_folha_de_personagem_imagem(ficha, pasta_destino):
+    """
+    Gera UMA imagem do personagem sozinho, em pose neutra e fundo limpo -
+    a "folha de personagem" que depois vai como referência em todas as
+    cenas do vídeo.
+
+    Só faz sentido em provedor que aceita referência (hoje, Gemini). Com
+    os gratuitos, quem sustenta a consistência é a ficha em TEXTO, e esta
+    função nem é chamada.
+    """
+    caminho = pasta_destino / "00_folha_personagem.jpg"
+    if caminho.exists():
+        print(f"    Folha de personagem já existe, reaproveitando: {caminho.name}")
+        return caminho
+
+    prompt = (
+        "Full body character reference sheet of a single character, "
+        "standing neutral pose, facing forward, plain light grey "
+        f"background, no text. {ficha}. {ESTILO_IMAGEM_IA}"
+    )
+    print("    Gerando a folha de personagem (uma vez por vídeo)...")
+    gerar_imagem_ia(prompt, caminho, semente=7)
+    return caminho
+
 _PROVEDORES_DE_IMAGEM = {
     "pollinations": _gerar_imagem_pollinations,
     "huggingface": _gerar_imagem_huggingface,
+    "gemini": _gerar_imagem_gemini,
 }
 
+# Provedores que aceitam imagem de referência. Só neles a folha de
+# personagem em IMAGEM faz diferença; nos outros a consistência depende
+# da ficha em texto.
+PROVEDORES_COM_REFERENCIA = ("gemini",)
 
-def gerar_imagem_ia(prompt, caminho, semente=0):
-    """Despacha pro provedor configurado em PROVEDOR_IMAGEM."""
+
+def provedor_aceita_referencia():
+    return PROVEDOR_IMAGEM in PROVEDORES_COM_REFERENCIA
+
+
+def gerar_imagem_ia(prompt, caminho, semente=0, referencia=None):
+    """Despacha pro provedor configurado em PROVEDOR_IMAGEM. A referência
+    é ignorada por quem não sabe usá-la."""
     gerador = _PROVEDORES_DE_IMAGEM.get(PROVEDOR_IMAGEM)
     if not gerador:
         raise ValueError(
             f"PROVEDOR_IMAGEM='{PROVEDOR_IMAGEM}' desconhecido. "
             f"Disponíveis: {', '.join(_PROVEDORES_DE_IMAGEM)}"
         )
+    if referencia and provedor_aceita_referencia():
+        return gerador(prompt, caminho, semente, referencia=referencia)
     return gerador(prompt, caminho, semente)
 
 
@@ -4291,6 +4466,20 @@ def gerar_broll_ilustrado(plano, pasta_destino, tema="", roteiro=""):
     pasta_destino.mkdir(parents=True, exist_ok=True)
     ficha = gerar_ficha_de_personagem(tema, roteiro) if roteiro else FICHA_PERSONAGEM_PADRAO
     print(f"    Ficha de personagem: {ficha}")
+
+    # Folha de personagem em IMAGEM: só em provedor que aceita referência.
+    # Mandar a mesma imagem junto de cada cena segura o personagem muito
+    # melhor do que repetir a descrição por escrito - mas se a geração da
+    # folha falhar, seguimos com a ficha em texto em vez de abortar tudo.
+    folha = None
+    if USAR_FOLHA_DE_PERSONAGEM and provedor_aceita_referencia():
+        try:
+            folha = gerar_folha_de_personagem_imagem(ficha, pasta_destino)
+        except Exception as erro:
+            print(
+                f"    Folha de personagem falhou ({type(erro).__name__}: "
+                f"{str(erro)[:150]}) - seguindo só com a ficha em texto."
+            )
 
     gerados = []
     rebaixados = []
@@ -4320,7 +4509,8 @@ def gerar_broll_ilustrado(plano, pasta_destino, tema="", roteiro=""):
 
         try:
             print(f"    [{segmento['indice']:02d}] gerando ilustração: {descricao[:70]}...")
-            gerar_imagem_ia(prompt, caminho, semente=1000 + posicao)
+            gerar_imagem_ia(prompt, caminho, semente=1000 + posicao, referencia=folha)
+            segmento["referencia_usada"] = folha.name if folha else None
             segmento["arquivo"] = nome
             gerados.append(nome)
         except Exception as erro:
