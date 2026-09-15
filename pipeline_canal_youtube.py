@@ -399,7 +399,34 @@ GERAR_EM_INGLES = True  # False = volta pro fluxo 100% em português direto
 # de expansão recuperou 9 e 1 palavra. Bloco de 300 palavras o modelo
 # entrega; roteiro inteiro, não. False volta pro comportamento antigo (faz
 # sentido com modelo grande na nuvem, que aguenta o texto todo de uma vez).
-ESCREVER_POR_BLOCOS = True
+# True = sempre por blocos. False = sempre numa chamada só.
+# "auto" (padrão) = por blocos só quando o ROTEIRISTA roda local. Faz
+# sentido porque o problema é do modelo pequeno: um modelo grande escreve
+# 1.400 palavras de uma vez, e aí seis chamadas só gastariam seis vezes
+# mais cota pra chegar no mesmo lugar.
+ESCREVER_POR_BLOCOS = "auto"
+
+# QUAIS ETAPAS VÃO PRA NUVEM, mesmo com USAR_NUVEM = False.
+#
+# Existe porque as etapas não têm a mesma dificuldade. Escrever 1.400
+# palavras de narrativa é onde o 7B local falha (mediu-se 532 e 361
+# palavras); já traduzir um termo de busca, ler o template do crítico ou
+# montar título e tags são tarefas curtas que ele faz bem. Mandar só o
+# roteiro pra nuvem compra a parte cara da qualidade gastando pouca cota.
+#
+# Nomes válidos (o resto continua local):
+#   "roteirista"  - escrita do roteiro, revisões e expansão
+#   "critico"     - avaliação do roteiro
+#   "traducao"    - tradução do roteiro pro português e dos termos de busca
+#   "metadados"   - títulos, thumbnail, descrição, tags e prompt do Gemini
+#   "pesquisa"    - escolha do que pesquisar no agente de fatos
+#   "temas"       - geração de temas a partir dos canais de referência
+#   "imagem"      - ficha de personagem e descrição de cena das ilustrações
+#
+# Se a nuvem falhar (sem chave, cota estourada, todos os modelos fora), a
+# etapa cai pro Ollama local automaticamente, com aviso - o vídeo não
+# morre por causa disso.
+AGENTES_NA_NUVEM = ("roteirista",)
 
 # Canais de referência do nicho pra puxar inspiração dos vídeos que mais
 # renderam. Handles confirmados (conferidos por busca, não chutados):
@@ -1607,7 +1634,23 @@ def _chamar_ollama_nativo(mensagens, temperature, max_tokens):
     return _RespostaOllamaNativa(conteudo, finish_reason)
 
 
-def chamar_llm(prompt, temperature=0.7, max_tokens=8192, avisar_corte=True):
+def _agente_vai_pra_nuvem(agente):
+    """USAR_NUVEM manda em tudo; fora isso, só os agentes listados em
+    AGENTES_NA_NUVEM sobem."""
+    return bool(USAR_NUVEM) or (agente in AGENTES_NA_NUVEM)
+
+
+def escrita_por_blocos_ativa():
+    """Com ESCREVER_POR_BLOCOS = "auto", a escrita em blocos só liga
+    quando o roteirista roda LOCAL - que é onde o problema de tamanho
+    existe."""
+    if isinstance(ESCREVER_POR_BLOCOS, str):
+        return not _agente_vai_pra_nuvem("roteirista")
+    return bool(ESCREVER_POR_BLOCOS)
+
+
+def chamar_llm(prompt, temperature=0.7, max_tokens=8192, avisar_corte=True,
+               agente=None):
     """
     max_tokens=8192 é um teto generoso - o valor anterior (4096) já cortou
     geração de roteiro E de expansão no meio, confirmado em log real (o
@@ -1619,15 +1662,37 @@ def chamar_llm(prompt, temperature=0.7, max_tokens=8192, avisar_corte=True):
     avisar, não importa o que o prompt peça.
     """
     mensagens = [{"role": "user", "content": prompt}]
+    na_nuvem = _agente_vai_pra_nuvem(agente)
 
-    if USAR_NUVEM:
-        if not client_groq:
+    if na_nuvem and not client_groq:
+        if USAR_NUVEM:
             raise RuntimeError(
                 "USAR_NUVEM está True mas GROQ_API_KEY não foi configurada. "
                 "Crie uma chave grátis em console.groq.com/keys e coloque "
                 "no .env, ou mude USAR_NUVEM para False pra usar o Ollama local."
             )
-        resposta = _chamar_groq_com_fallback(mensagens, temperature, max_tokens)
+        # Só esta ETAPA pediu nuvem: sem chave, ela cai pro local em vez
+        # de derrubar o vídeo inteiro.
+        print(
+            f"    Aviso: a etapa '{agente}' está em AGENTES_NA_NUVEM mas "
+            "GROQ_API_KEY não está no .env - rodando local."
+        )
+        na_nuvem = False
+
+    if na_nuvem:
+        try:
+            resposta = _chamar_groq_com_fallback(mensagens, temperature, max_tokens)
+        except Exception as erro:
+            if USAR_NUVEM:
+                raise
+            # Cota estourada ou todos os modelos fora: a etapa continua,
+            # só que no modelo local. Pior qualidade, mas entrega.
+            print(
+                f"    Aviso: a nuvem falhou na etapa '{agente}' "
+                f"({type(erro).__name__}: {str(erro)[:120]}) - "
+                "refazendo esta chamada no Ollama local."
+            )
+            resposta = _chamar_ollama_nativo(mensagens, temperature, max_tokens)
     else:
         resposta = _chamar_ollama_nativo(mensagens, temperature, max_tokens)
 
@@ -1829,7 +1894,7 @@ def gerar_temas_por_referencia(titulos_referencia, quantidade=6):
         return "", []
     lista_formatada = "\n".join(f"- {t}" for t in titulos_referencia)
     prompt = REFERENCIA_PROMPT.format(titulos_referencia=lista_formatada)
-    resposta = chamar_llm(prompt, temperature=0.8, max_tokens=1500)
+    resposta = chamar_llm(prompt, temperature=0.8, max_tokens=1500, agente="temas")
     temas = re.findall(r"^\d+\.\s*(.+)$", resposta, re.MULTILINE)
     temas = [limpar_tema(t) for t in temas]
     return resposta, temas[:quantidade]
@@ -2274,7 +2339,8 @@ def definir_entidade_e_termos(tema):
     # "pensando" antes de escrever - foi o que já quebrou a tradução de
     # termo de busca do b-roll.
     try:
-        resposta = chamar_llm(prompt, temperature=0.2, max_tokens=300, avisar_corte=False)
+        resposta = chamar_llm(prompt, temperature=0.2, max_tokens=300,
+                              avisar_corte=False, agente="pesquisa")
     except Exception as erro:
         print(f"    (pesquisa: LLM não respondeu na escolha do termo - {type(erro).__name__})")
         return "", [tema]
@@ -2823,6 +2889,7 @@ def escrever_roteiro_por_blocos(tema, dossie=None):
             temperature=0.8,
             max_tokens=teto_tokens,
             avisar_corte=False,
+            agente="roteirista",
         )
         palavras = contar_palavras_narracao(texto)
 
@@ -2841,6 +2908,7 @@ def escrever_roteiro_por_blocos(tema, dossie=None):
                 temperature=0.8,
                 max_tokens=teto_tokens,
                 avisar_corte=False,
+                agente="roteirista",
             )
             palavras_novo = contar_palavras_narracao(texto_novo)
             if palavras_novo > palavras:
@@ -2872,7 +2940,7 @@ def escrever_roteiro(tema, roteiro_anterior=None, mudancas_obrigatorias=None,
     # escrever_roteiro_por_blocos). As REVISÕES continuam em chamada única:
     # lá o modelo recebe um texto pronto pra corrigir, não precisa produzir
     # 1.400 palavras do zero.
-    if roteiro_anterior is None and ESCREVER_POR_BLOCOS:
+    if roteiro_anterior is None and escrita_por_blocos_ativa():
         return escrever_roteiro_por_blocos(tema, dossie=dossie)
 
     template = ROTEIRO_PROMPT_EN if GERAR_EM_INGLES else ROTEIRO_PROMPT
@@ -2940,7 +3008,7 @@ def escrever_roteiro(tema, roteiro_anterior=None, mudancas_obrigatorias=None,
                 "tentativas):\n"
                 f"{historico_formatado}"
             )
-    return chamar_llm(prompt, temperature=0.8, max_tokens=8192)
+    return chamar_llm(prompt, temperature=0.8, max_tokens=8192, agente="roteirista")
 
 
 # =========================================================================
@@ -2986,7 +3054,7 @@ def avaliar_roteiro(roteiro, mudancas_pedidas_antes=None, dossie=None):
             "listados? Só liste como obrigatório o que for genuinamente "
             "novo ou genuinamente não resolvido."
         )
-    return chamar_llm(prompt, temperature=0.2, max_tokens=2500)
+    return chamar_llm(prompt, temperature=0.2, max_tokens=2500, agente="critico")
 
 
 def _truncar(texto, limite_caracteres, rotulo="trecho"):
@@ -3675,7 +3743,8 @@ def traduzir_termo_busca(termo_pt):
     )
     try:
         resposta = chamar_llm(
-            prompt, temperature=0.3, max_tokens=300, avisar_corte=False
+            prompt, temperature=0.3, max_tokens=300, avisar_corte=False,
+            agente="traducao",
         )
     except Exception as e:
         print(
@@ -4070,7 +4139,8 @@ def gerar_ficha_de_personagem(tema, roteiro):
         f"SCRIPT:\n{_truncar(roteiro, 4000, 'roteiro')}"
     )
     try:
-        resposta = chamar_llm(prompt, temperature=0.4, max_tokens=300, avisar_corte=False)
+        resposta = chamar_llm(prompt, temperature=0.4, max_tokens=300,
+                              avisar_corte=False, agente="imagem")
     except Exception as erro:
         print(f"    (ficha de personagem: LLM falhou - {type(erro).__name__})")
         return FICHA_PERSONAGEM_PADRAO
@@ -4113,7 +4183,8 @@ def descrever_cena_para_imagem(narracao, visual):
         f"VISUAL NOTE: {visual[:300]}"
     )
     try:
-        resposta = chamar_llm(prompt, temperature=0.5, max_tokens=300, avisar_corte=False)
+        resposta = chamar_llm(prompt, temperature=0.5, max_tokens=300,
+                              avisar_corte=False, agente="imagem")
     except Exception as erro:
         print(f"    (descrição de cena: LLM falhou - {type(erro).__name__})")
         return ""
@@ -4327,7 +4398,7 @@ def gerar_metadados(tema, roteiro):
     prompt = METADADOS_PROMPT.format(
         tema=tema, roteiro=_truncar(roteiro, 20000, "roteiro")
     )
-    return chamar_llm(prompt, temperature=0.8, max_tokens=2000)
+    return chamar_llm(prompt, temperature=0.8, max_tokens=2000, agente="metadados")
 
 
 def extrair_descricao_foto(metadados_texto):
@@ -4353,7 +4424,7 @@ def extrair_descricao_foto(metadados_texto):
 
 def gerar_prompt_imagem(descricao_foto):
     prompt = PROMPT_IMAGEM_PROMPT.format(descricao_foto=descricao_foto)
-    return chamar_llm(prompt, temperature=0.6, max_tokens=800)
+    return chamar_llm(prompt, temperature=0.6, max_tokens=800, agente="metadados")
 
 
 def contar_palavras_narracao(roteiro):
@@ -4459,7 +4530,7 @@ def expandir_roteiro(roteiro, tema, palavras_atuais, alvo_minimo=1270):
             "comentário sobre a tarefa, sem repetir nomes de passo, sem "
             "adicionar um '---' ou qualquer divisor no meio do texto."
         )
-    return chamar_llm(prompt, temperature=0.7, max_tokens=8192)
+    return chamar_llm(prompt, temperature=0.7, max_tokens=8192, agente="roteirista")
 
 
 def traduzir_roteiro_para_ptbr(roteiro_ingles):
@@ -4473,7 +4544,7 @@ def traduzir_roteiro_para_ptbr(roteiro_ingles):
     prompt = TRADUCAO_PROMPT.format(
         roteiro_ingles=_truncar(roteiro_ingles, 20000, "roteiro em inglês")
     )
-    return chamar_llm(prompt, temperature=0.3, max_tokens=8192)
+    return chamar_llm(prompt, temperature=0.3, max_tokens=8192, agente="traducao")
 
 
 # =========================================================================
@@ -4642,7 +4713,7 @@ def gerar_video_completo(tema, max_tentativas=4, pesquisar=None):
         # palavra num de 361 - não resolve, e cada chamada dessas custa
         # minutos. Quem garante o tamanho agora é a retentativa por bloco,
         # que trabalha sobre 300 palavras em vez de 1.300.
-        if not ESCREVER_POR_BLOCOS:
+        if not escrita_por_blocos_ativa():
             roteiro = aplicar_expansao(roteiro, tema)
         else:
             palavras_agora = contar_palavras_narracao(roteiro)

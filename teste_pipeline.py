@@ -221,7 +221,63 @@ def testar_escrita_por_blocos():
 
 
 # =========================================================================
-# 8. FLUXO COMPLETO (pesquisa -> roteiro -> crítico -> tradução -> relatório)
+# 8. NUVEM SÓ PRA ALGUMAS ETAPAS
+# =========================================================================
+def testar_roteamento_por_agente():
+    print("\n8. Nuvem só pra algumas etapas")
+    original = {"groq": pipe._chamar_groq_com_fallback,
+                "ollama": pipe._chamar_ollama_nativo,
+                "client": pipe.client_groq,
+                "agentes": pipe.AGENTES_NA_NUVEM,
+                "usar_nuvem": pipe.USAR_NUVEM}
+
+    def resposta(texto):
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content=texto), finish_reason="stop")])
+    try:
+        pipe._chamar_groq_com_fallback = lambda m, t, mt: resposta("NUVEM")
+        pipe._chamar_ollama_nativo = lambda m, t, mt: resposta("LOCAL")
+        pipe.client_groq = object()
+        pipe.USAR_NUVEM = False
+        pipe.AGENTES_NA_NUVEM = ("roteirista",)
+
+        checar("a etapa listada sobe pra nuvem",
+               pipe.chamar_llm("x", agente="roteirista") == "NUVEM")
+        checar("as outras etapas continuam locais",
+               all(pipe.chamar_llm("x", agente=a) == "LOCAL"
+                   for a in ("critico", "traducao", "metadados", "imagem", None)))
+        checar("blocos desligam sozinhos com o roteirista na nuvem",
+               not pipe.escrita_por_blocos_ativa()
+               if isinstance(pipe.ESCREVER_POR_BLOCOS, str) else True)
+
+        def groq_sem_cota(m, t, mt):
+            raise RuntimeError("rate limit exceeded")
+        pipe._chamar_groq_com_fallback = groq_sem_cota
+        checar("cota estourada cai pro local em vez de derrubar o vídeo",
+               pipe.chamar_llm("x", agente="roteirista") == "LOCAL")
+
+        pipe.client_groq = None
+        checar("sem GROQ_API_KEY a etapa roda local, sem quebrar",
+               pipe.chamar_llm("x", agente="roteirista") == "LOCAL")
+
+        # Com USAR_NUVEM global, a falta de chave continua sendo erro claro
+        pipe.USAR_NUVEM = True
+        try:
+            pipe.chamar_llm("x", agente="critico")
+            falhou = False
+        except RuntimeError:
+            falhou = True
+        checar("USAR_NUVEM global sem chave continua avisando alto", falhou)
+    finally:
+        pipe._chamar_groq_com_fallback = original["groq"]
+        pipe._chamar_ollama_nativo = original["ollama"]
+        pipe.client_groq = original["client"]
+        pipe.AGENTES_NA_NUVEM = original["agentes"]
+        pipe.USAR_NUVEM = original["usar_nuvem"]
+
+
+# =========================================================================
+# 9. FLUXO COMPLETO (pesquisa -> roteiro -> crítico -> tradução -> relatório)
 # =========================================================================
 ARTIGO_FALSO = """NorteSul Logística é uma transportadora fictícia fundada em 2004.
 
@@ -417,7 +473,7 @@ def testar_broll_hibrido():
 
 
 def testar_fluxo_completo():
-    print("\n8. Fluxo completo do vídeo")
+    print("\n9. Fluxo completo do vídeo")
     pasta = Path(tempfile.mkdtemp(prefix="ensaio_pipeline_"))
     original = {
         "requests": pipe.requests,
@@ -474,7 +530,8 @@ def testar_fluxo_completo():
 
     rodadas = {"critico": 0}
 
-    def llm_dublê(prompt, temperature=0.7, max_tokens=8192, avisar_corte=True):
+    def llm_dublê(prompt, temperature=0.7, max_tokens=8192, avisar_corte=True,
+                  agente=None, **extras):
         if "EMPRESA:" in prompt and "TERMOS:" in prompt:
             return "EMPRESA: NorteSul Logística\nTERMOS: NorteSul Logística"
         if "editor crítico de retenção" in prompt or "audience-retention critic" in prompt:
@@ -564,6 +621,7 @@ if __name__ == "__main__":
     testar_escolha_do_artigo()
     testar_broll_hibrido()
     testar_escrita_por_blocos()
+    testar_roteamento_por_agente()
     testar_fluxo_completo()
     print("\n" + "=" * 70)
     if FALHAS:
