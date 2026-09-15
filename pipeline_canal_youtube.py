@@ -3,6 +3,14 @@ Pipeline de criação de roteiros para YouTube - nicho empresas/administração
 ============================================================================
 
 4 AGENTES:
+0. Pesquisador de fatos -> ANTES de escrever, levanta material real sobre o
+    tema (Wikipédia + Wikidata + manchetes datadas do Google News) e passa
+    esse dossiê pro roteirista e pro crítico. Sem chave de API, com cache em
+    disco. Existe porque o roteirista não consulta nada: tudo que ele
+    escreve sai da memória do modelo, e memória de modelo inventa com
+    confiança (um roteiro aprovado já descreveu relatório, vídeo viral e
+    reunião de diretoria que nunca existiram). Desligue em
+    USAR_PESQUISA_DE_FATOS se estiver sem internet.
 1. Pesquisador  -> função pesquisar_temas_em_alta() continua no código, mas
     NÃO é chamada em lugar nenhum do fluxo interativo - manchete de jornal
     quase nunca vira tema bom aqui (vem com nome do veículo colado, é
@@ -262,6 +270,27 @@ CAMINHO_ESTATISTICAS_APRENDIZADO = PASTA_DO_SCRIPT / ".estatisticas_aprendizado.
 # Campos do template de avaliação que indicam um problema real quando
 # preenchidos (o valor "vazio" de cada um varia - por isso a checagem
 # fica em _campo_indica_problema, não aqui)
+# =========================================================================
+# PESQUISA DE FATOS (agente 0) - o que o roteirista lê antes de escrever
+# =========================================================================
+# True = antes de escrever, o pipeline levanta material real sobre o tema
+# (Wikipédia + Wikidata + manchetes) e entrega isso pro roteirista. Custa
+# 1 chamada curta ao LLM (pra decidir o que pesquisar) + alguns segundos
+# de internet, e não usa chave de API nenhuma. False = volta ao
+# comportamento antigo, em que tudo sai da memória do modelo.
+USAR_PESQUISA_DE_FATOS = True
+
+PESQUISA_TIMEOUT_S = 12          # por requisição; fonte lenta é pulada
+PESQUISA_MAX_CHARS_DOSSIE = 6000  # teto do dossiê no prompt da 1ª escrita
+PESQUISA_MAX_CHARS_DOSSIE_CURTO = 2000  # nas revisões e no crítico, onde o
+                                        # prompt já carrega o roteiro inteiro
+PESQUISA_MAX_MANCHETES = 10
+PESQUISA_VALIDADE_CACHE_DIAS = 7
+
+# O dossiê fica em cache porque "refazer só o roteiro" e cada tentativa do
+# loop usariam exatamente o mesmo material.
+PASTA_CACHE_PESQUISA = PASTA_DO_SCRIPT / ".cache_pesquisa"
+
 _CAMPOS_PROBLEMA_APRENDIZADO = (
     "MINI-GANCHOS FALTANDO",
     "JARGÃO NÃO EXPLICADO",
@@ -1693,12 +1722,645 @@ def gerar_temas_por_referencia(titulos_referencia, quantidade=6):
 
 
 # =========================================================================
+# AGENTE 0 - PESQUISADOR DE FATOS (roda ANTES do roteirista)
+# =========================================================================
+# Por que existe: o roteirista não tem como consultar nada, então tudo que
+# ele escreve sai da memória do modelo - e memória de modelo inventa com
+# confiança. Foi assim que um roteiro aprovado descreveu relatório, vídeo
+# viral e reunião de diretoria que nunca existiram. O crítico não resolve
+# isso: ele também não pesquisa, só consegue MARCAR a dúvida.
+#
+# Este agente levanta o material ANTES de escrever, de fontes abertas e
+# sem chave de API, e entrega um dossiê que vai junto no prompt. O efeito
+# é o roteiro passar a contar uma história que existe, em vez de uma
+# história plausível.
+#
+# NÃO substitui sua revisão: Wikipédia e manchete são fonte secundária. O
+# que muda é o tamanho do trabalho - em vez de checar 20 fatos do zero,
+# você confere um checklist que já aponta quais números aparecem no
+# material levantado e quais apareceram do nada.
+
+_PESQUISA_HEADERS = {
+    # A Wikimedia pede um User-Agent identificável; sem isso a API pode
+    # responder 403 em vez do JSON.
+    "User-Agent": "PipelineCanalYouTube/1.0 (uso pessoal, roteiro de video)"
+}
+
+# Seções de artigo que interessam pra esse canal (história, crise,
+# polêmica) - o resto (lista de produtos, ligações externas, elenco de
+# diretoria atual) só gastaria contexto.
+_SECOES_INTERESSANTES = (
+    "história", "historia", "fundação", "fundacao", "origem", "origens",
+    "crise", "controvérsia", "controversia", "polêmica", "polemica",
+    "processo", "processos", "escândalo", "escandalo", "expansão",
+    "expansao", "aquisição", "aquisicao", "aquisições", "aquisicoes",
+    "modelo de negócio", "modelo de negocios", "negócios", "negocios",
+    "crítica", "critica", "críticas", "criticas", "financeiro",
+    "resultados", "reestruturação", "reestruturacao", "falência",
+    "falencia", "history", "founding", "origins", "controversy",
+    "criticism", "lawsuit", "lawsuits", "expansion", "acquisitions",
+    "business model", "finances", "financial", "bankruptcy",
+)
+
+# Propriedades do Wikidata que viram fato estruturado no dossiê. São
+# dados com fonte, data e unidade - o oposto do número que o modelo
+# "lembra".
+_PROPRIEDADES_WIKIDATA = {
+    "P571": "Fundação",
+    "P112": "Fundador(es)",
+    "P169": "CEO",
+    "P159": "Sede",
+    "P452": "Setor",
+    "P1128": "Funcionários",
+    "P2139": "Receita",
+    "P2295": "Lucro/prejuízo líquido",
+    "P1454": "Forma jurídica",
+}
+
+_UNIDADES_WIKIDATA = {
+    "Q4917": "US$", "Q4916": "€", "Q41726": "R$", "Q25224": "£",
+}
+
+
+def _pesquisa_get(url, params, timeout=None):
+    """GET curto e tolerante: qualquer falha (sem internet, 403, timeout,
+    JSON quebrado) devolve None, e quem chamou segue sem aquela fonte. O
+    pipeline nunca pode morrer porque a Wikipédia demorou pra responder."""
+    try:
+        resposta = requests.get(
+            url,
+            params=params,
+            headers=_PESQUISA_HEADERS,
+            timeout=timeout or PESQUISA_TIMEOUT_S,
+        )
+        resposta.raise_for_status()
+        return resposta.json()
+    except Exception as erro:
+        print(f"    (pesquisa: {url.split('/')[2]} não respondeu - {type(erro).__name__})")
+        return None
+
+
+def _quebrar_em_secoes(texto):
+    """Separa o texto puro de um artigo da Wikipédia em (título, conteúdo).
+    Com explaintext=1 os títulos vêm como '== História ==' em linha
+    própria."""
+    pedacos = re.split(r"\n(={2,}[^=\n]+={2,})\n", texto)
+    secoes = [("(introdução)", pedacos[0])]
+    for i in range(1, len(pedacos) - 1, 2):
+        secoes.append((pedacos[i].strip("= ").strip(), pedacos[i + 1]))
+    return secoes
+
+
+def _resumir_artigo(texto, limite):
+    """Fica com a introdução + as seções que interessam, dentro do limite
+    de caracteres. Contexto é recurso escasso aqui (o modelo local tem
+    16k no total, e o prompt do roteirista já é grande), então o dossiê
+    precisa caber, não ser completo."""
+    partes = []
+    total = 0
+    for titulo, conteudo in _quebrar_em_secoes(texto):
+        conteudo = conteudo.strip()
+        if not conteudo:
+            continue
+        chave = titulo.lower()
+        interessa = titulo == "(introdução)" or any(
+            s in chave for s in _SECOES_INTERESSANTES
+        )
+        if not interessa:
+            continue
+        disponivel = limite - total
+        if disponivel <= 200:
+            break
+        trecho = conteudo[:disponivel]
+        partes.append(f"[{titulo}]\n{trecho}")
+        total += len(trecho)
+    return "\n\n".join(partes)
+
+
+def buscar_wikipedia(termo, idioma="pt", limite_caracteres=3500):
+    """
+    Busca o artigo e devolve {titulo, url, texto} ou None.
+
+    Duas chamadas: uma pra achar o título certo (busca por texto livre) e
+    outra pro conteúdo. Não usa chave de API.
+    """
+    base = f"https://{idioma}.wikipedia.org/w/api.php"
+    busca = _pesquisa_get(base, {
+        "action": "query", "list": "search", "srsearch": termo,
+        "srlimit": 1, "format": "json",
+    })
+    if not busca:
+        return None
+    resultados = busca.get("query", {}).get("search", [])
+    if not resultados:
+        return None
+    titulo = resultados[0]["title"]
+
+    conteudo = _pesquisa_get(base, {
+        "action": "query", "prop": "extracts", "explaintext": 1,
+        "exsectionformat": "plain", "redirects": 1, "titles": titulo,
+        "format": "json",
+    })
+    if not conteudo:
+        return None
+    paginas = conteudo.get("query", {}).get("pages", {})
+    for pagina in paginas.values():
+        texto = pagina.get("extract", "")
+        if not texto:
+            continue
+        return {
+            "titulo": pagina.get("title", titulo),
+            "url": f"https://{idioma}.wikipedia.org/wiki/"
+                   + pagina.get("title", titulo).replace(" ", "_"),
+            "texto": _resumir_artigo(texto, limite_caracteres),
+        }
+    return None
+
+
+def _valor_wikidata(valor_bruto):
+    """Traduz o valor de uma claim do Wikidata pra texto. Devolve
+    (texto, qid_pra_resolver) - quando o valor é outra entidade, o nome
+    dela só vem numa segunda chamada."""
+    if not isinstance(valor_bruto, dict):
+        return None, None
+    tipo = valor_bruto.get("type")
+    valor = valor_bruto.get("value")
+    if tipo == "time" and isinstance(valor, dict):
+        # formato "+1999-08-02T00:00:00Z"
+        achado = re.search(r"([+-])(\d{4})-(\d{2})-(\d{2})", valor.get("time", ""))
+        if not achado:
+            return None, None
+        _, ano, mes, dia = achado.groups()
+        if mes != "00" and dia != "00":
+            return f"{dia}/{mes}/{ano}", None
+        return ano, None
+    if tipo == "quantity" and isinstance(valor, dict):
+        quantidade = valor.get("amount", "").lstrip("+")
+        unidade_id = (valor.get("unit") or "").rsplit("/", 1)[-1]
+        unidade = _UNIDADES_WIKIDATA.get(unidade_id, "")
+        try:
+            bruto = float(quantidade)
+        except ValueError:
+            return (f"{unidade} {quantidade}".strip()), None
+        cheio = f"{bruto:,.0f}".replace(",", ".")
+        # Mostra os dois formatos de propósito: "14,47 bilhões" é o que o
+        # roteirista vai narrar, e o número cheio é o que faz o checklist
+        # casar quando o roteiro escrever o valor por extenso.
+        if abs(bruto) >= 1_000_000_000:
+            legivel = f"{bruto / 1_000_000_000:.2f}".replace(".", ",") + " bilhões"
+        elif abs(bruto) >= 1_000_000:
+            legivel = f"{bruto / 1_000_000:.2f}".replace(".", ",") + " milhões"
+        else:
+            return (f"{unidade} {cheio}".strip()), None
+        return (f"{unidade} {legivel} ({cheio})".strip()), None
+    if tipo == "wikibase-entityid" and isinstance(valor, dict):
+        return None, valor.get("id")
+    if isinstance(valor, str):
+        return valor, None
+    return None, None
+
+
+def _ano_da_claim(claim):
+    """Ano do qualificador 'ponto no tempo' (P585), quando existe - é o
+    que diferencia 'receita de 2015' de 'receita de 2024'."""
+    for qualificador in claim.get("qualifiers", {}).get("P585", []):
+        texto, _ = _valor_wikidata(qualificador.get("datavalue", {}))
+        if texto:
+            return texto[-4:]
+    return None
+
+
+def buscar_wikidata(termo, idioma="pt"):
+    """
+    Fatos estruturados (fundação, sede, fundador, funcionários, receita).
+    Devolve lista de strings prontas pro dossiê. Vale a pena porque aqui
+    o número vem com unidade e ano, não da memória do modelo.
+    """
+    busca = _pesquisa_get("https://www.wikidata.org/w/api.php", {
+        "action": "wbsearchentities", "search": termo, "language": idioma,
+        "uselang": idioma, "limit": 1, "format": "json",
+    })
+    if not busca or not busca.get("search"):
+        return [], None
+    entidade_id = busca["search"][0]["id"]
+
+    dados = _pesquisa_get("https://www.wikidata.org/w/api.php", {
+        "action": "wbgetentities", "ids": entidade_id, "props": "claims",
+        "format": "json",
+    })
+    if not dados:
+        return [], None
+    claims = dados.get("entities", {}).get(entidade_id, {}).get("claims", {})
+
+    fatos = []
+    qids_pendentes = {}
+    for propriedade, rotulo in _PROPRIEDADES_WIKIDATA.items():
+        melhor_texto = None
+        melhor_ano = None
+        for claim in claims.get(propriedade, []):
+            datavalue = claim.get("mainsnak", {}).get("datavalue", {})
+            texto, qid = _valor_wikidata(datavalue)
+            ano = _ano_da_claim(claim)
+            # Entre várias declarações da mesma propriedade (receita de
+            # vários anos), fica com a mais recente.
+            if melhor_ano and ano and ano <= melhor_ano:
+                continue
+            if qid:
+                qids_pendentes.setdefault(qid, []).append(len(fatos))
+                texto = f"@@{qid}@@"
+            if texto:
+                melhor_texto, melhor_ano = texto, ano or melhor_ano
+        if melhor_texto:
+            sufixo = f" (em {melhor_ano})" if melhor_ano else ""
+            fatos.append(f"- {rotulo}: {melhor_texto}{sufixo}")
+
+    # Resolve os nomes das entidades citadas (fundador, sede, setor) numa
+    # chamada só, em vez de uma por item.
+    if qids_pendentes:
+        rotulos = _pesquisa_get("https://www.wikidata.org/w/api.php", {
+            "action": "wbgetentities", "ids": "|".join(list(qids_pendentes)[:20]),
+            "props": "labels", "languages": f"{idioma}|en", "format": "json",
+        })
+        entidades = (rotulos or {}).get("entities", {})
+        for qid in qids_pendentes:
+            etiquetas = entidades.get(qid, {}).get("labels", {})
+            nome = (etiquetas.get(idioma) or etiquetas.get("en") or {}).get("value", qid)
+            fatos = [f.replace(f"@@{qid}@@", nome) for f in fatos]
+
+    return fatos, f"https://www.wikidata.org/wiki/{entidade_id}"
+
+
+def buscar_manchetes(termo, limite=None):
+    """
+    Manchetes do Google News RSS: cada uma é um evento com DATA e VEÍCULO,
+    que é exatamente o que falta pro campo "EVENTO SEM VERIFICAR" - o
+    roteiro deixa de inventar o enredo e passa a contar o que saiu na
+    imprensa, com data conferível.
+    """
+    from urllib.parse import quote
+
+    limite = limite or PESQUISA_MAX_MANCHETES
+    try:
+        import feedparser
+    except ImportError:
+        print("    (pesquisa: feedparser não instalado - pulando manchetes. "
+              "Instale com: pip install feedparser)")
+        return []
+
+    url = (
+        f"https://news.google.com/rss/search?q={quote(termo)}"
+        "&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+    )
+    try:
+        feed = feedparser.parse(url)
+    except Exception as erro:
+        print(f"    (pesquisa: Google News não respondeu - {type(erro).__name__})")
+        return []
+
+    manchetes = []
+    for entrada in getattr(feed, "entries", [])[:limite]:
+        titulo = getattr(entrada, "title", "").strip()
+        if not titulo:
+            continue
+        data = ""
+        publicado = getattr(entrada, "published_parsed", None)
+        if publicado:
+            data = f"{publicado.tm_year}-{publicado.tm_mon:02d}-{publicado.tm_mday:02d}"
+        veiculo = ""
+        fonte = getattr(entrada, "source", None)
+        if fonte is not None:
+            veiculo = getattr(fonte, "title", "") or ""
+        manchetes.append({"data": data, "veiculo": veiculo, "titulo": titulo})
+    return manchetes
+
+
+def definir_entidade_e_termos(tema):
+    """
+    Uma chamada curta ao LLM só pra decidir O QUE pesquisar. É preciso
+    porque o tema costuma vir como manchete ou pergunta ("o erro de
+    gestão que quase derrubou um gigante do delivery"), e buscar isso
+    literalmente na Wikipédia não devolve nada.
+
+    Formato de linha fixa em vez de JSON: modelo pequeno erra chave e
+    vírgula de JSON com frequência, mas acerta "RÓTULO: valor".
+    """
+    prompt = (
+        "Você é um pesquisador. Leia o tema de vídeo abaixo e responda "
+        "EXATAMENTE neste formato, sem nenhum comentário:\n\n"
+        "EMPRESA: [nome real e oficial de UMA empresa/organização que é o "
+        "fio condutor do tema. Se o tema não citar nenhuma, escolha a mais "
+        "emblemática do assunto. Nome puro, sem explicação.]\n"
+        "TERMOS: [2 a 3 termos de busca separados por | , começando pelo "
+        "nome da empresa. Ex: Americanas | Americanas fraude contábil]\n\n"
+        f"TEMA: {tema}"
+    )
+    # 300 e não 30/200: modelo de raciocínio (gpt-oss) gasta parte do teto
+    # "pensando" antes de escrever - foi o que já quebrou a tradução de
+    # termo de busca do b-roll.
+    try:
+        resposta = chamar_llm(prompt, temperature=0.2, max_tokens=300, avisar_corte=False)
+    except Exception as erro:
+        print(f"    (pesquisa: LLM não respondeu na escolha do termo - {type(erro).__name__})")
+        return "", [tema]
+
+    empresa = ""
+    achado = re.search(r"EMPRESA:\s*(.+)", resposta)
+    if achado:
+        empresa = achado.group(1).strip().strip("[]*_ ").split("\n")[0]
+
+    termos = []
+    achado = re.search(r"TERMOS:\s*(.+)", resposta)
+    if achado:
+        termos = [
+            t.strip().strip("[]*_ ")
+            for t in achado.group(1).split("|")
+            if t.strip().strip("[]*_ ")
+        ]
+
+    # Sem resposta utilizável, pesquisa o próprio tema - pior busca, mas
+    # melhor que não pesquisar nada.
+    if not empresa and not termos:
+        return "", [tema]
+    if not termos:
+        termos = [empresa]
+    if empresa and empresa not in termos:
+        termos.insert(0, empresa)
+    return empresa, termos[:3]
+
+
+def _caminho_cache_dossie(tema):
+    return PASTA_CACHE_PESQUISA / f"{_slugificar(tema, 60)}.json"
+
+
+def pesquisar_dossie(tema, usar_cache=True):
+    """
+    Junta tudo num dossiê só. Devolve dict com entidade, texto, fontes e
+    manchetes - ou None se não conseguiu levantar nada (aí o pipeline
+    segue como antes, só sem dossiê).
+
+    Tem cache em disco porque "refazer só o roteiro" e cada tentativa do
+    loop usariam o mesmo material: repetir a busca seria lento e sem
+    ganho nenhum.
+    """
+    caminho = _caminho_cache_dossie(tema)
+    if usar_cache and caminho.exists():
+        try:
+            with open(caminho, "r", encoding="utf-8") as f:
+                dossie = json.load(f)
+            idade_dias = (
+                datetime.now() - datetime.fromisoformat(dossie["gerado_em"])
+            ).days
+            if idade_dias <= PESQUISA_VALIDADE_CACHE_DIAS:
+                print(f"  Dossiê reaproveitado do cache ({caminho.name}, {idade_dias}d).")
+                return dossie
+        except (json.JSONDecodeError, OSError, KeyError, ValueError):
+            pass
+
+    print("Pesquisando fatos sobre o tema antes de escrever...")
+    entidade, termos = definir_entidade_e_termos(tema)
+    print(f"  Assunto central identificado: {entidade or termos[0]}")
+
+    fontes = []
+    blocos = []
+
+    artigo = buscar_wikipedia(termos[0])
+    if not artigo and entidade:
+        artigo = buscar_wikipedia(entidade)
+    if not artigo:
+        # Artigo em inglês costuma ser mais completo pra empresa de fora.
+        artigo = buscar_wikipedia(termos[0], idioma="en")
+    if artigo:
+        print(f"  Wikipédia: {artigo['titulo']} ({len(artigo['texto'])} caracteres)")
+        fontes.append(artigo["url"])
+        blocos.append(f"=== WIKIPÉDIA - {artigo['titulo']} ===\n{artigo['texto']}")
+
+    fatos, url_wikidata = buscar_wikidata(entidade or termos[0])
+    if fatos:
+        print(f"  Wikidata: {len(fatos)} fato(s) estruturado(s)")
+        if url_wikidata:
+            fontes.append(url_wikidata)
+        blocos.append("=== FATOS ESTRUTURADOS (Wikidata) ===\n" + "\n".join(fatos))
+
+    manchetes = []
+    for termo in termos:
+        for item in buscar_manchetes(termo):
+            if item["titulo"] not in [m["titulo"] for m in manchetes]:
+                manchetes.append(item)
+        if len(manchetes) >= PESQUISA_MAX_MANCHETES:
+            break
+    manchetes = manchetes[:PESQUISA_MAX_MANCHETES]
+    if manchetes:
+        print(f"  Google News: {len(manchetes)} manchete(s)")
+        linhas = [
+            f"- {m['data'] or 'sem data'} | {m['veiculo'] or 'veículo não informado'}: {m['titulo']}"
+            for m in manchetes
+        ]
+        blocos.append(
+            "=== MANCHETES (Google News - cada uma é um evento datado e "
+            "conferível) ===\n" + "\n".join(linhas)
+        )
+
+    if not blocos:
+        print("  Nenhuma fonte respondeu - seguindo sem dossiê (roteiro "
+              "volta a depender só da memória do modelo).")
+        return None
+
+    dossie = {
+        "tema": tema,
+        "entidade": entidade,
+        "termos": termos,
+        "texto": "\n\n".join(blocos),
+        "fontes": fontes,
+        "manchetes": manchetes,
+        "gerado_em": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    try:
+        PASTA_CACHE_PESQUISA.mkdir(exist_ok=True)
+        with open(caminho, "w", encoding="utf-8") as f:
+            json.dump(dossie, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+    return dossie
+
+
+def texto_do_dossie(dossie, limite=None):
+    """O dossiê cortado no tamanho que cabe no prompt de quem vai receber
+    (o roteirista na primeira escrita leva o completo; nas revisões e no
+    crítico vai a versão curta, porque lá o prompt já carrega o roteiro
+    inteiro)."""
+    if not dossie:
+        return ""
+    return _truncar(dossie["texto"], limite or PESQUISA_MAX_CHARS_DOSSIE, "dossiê")
+
+
+def _instrucoes_do_dossie_pt(dossie_texto):
+    return (
+        "\n\nDOSSIÊ DE PESQUISA (levantado automaticamente ANTES de você "
+        "escrever, de fontes abertas):\n"
+        f"{dossie_texto}\n\n"
+        "COMO USAR O DOSSIÊ (regras duras):\n"
+        "- A história do roteiro tem que ser a que está no dossiê. Fato, "
+        "evento, data e número que NÃO estão aqui, você não sabe - ou "
+        "deixa de fora, ou escreve de forma genérica sem número. Nunca "
+        "complete uma lacuna com algo plausível.\n"
+        "- As manchetes provam que o evento aconteceu naquela data, e só "
+        "isso. Não invente o conteúdo da reportagem a partir do título: "
+        "se a manchete diz 'empresa é processada', não escreva o valor do "
+        "processo nem o nome do juiz.\n"
+        "- Não copie frase da Wikipédia. Reescreva tudo em linguagem "
+        "falada - o texto é pra ser narrado, não lido.\n"
+        "- Continue marcando [VERIFICAR] em número específico, mesmo nos "
+        "que vieram do dossiê. O dossiê é fonte secundária: serve pra "
+        "você não inventar, não pra dispensar a conferência final.\n"
+        "- Se o dossiê contradiz o TEMA, siga o dossiê e ajuste o ângulo."
+    )
+
+
+def _instrucoes_do_dossie_en(dossie_texto):
+    return (
+        "\n\nRESEARCH DOSSIER (gathered automatically from open sources "
+        "BEFORE you write - it is in Portuguese, your script stays in "
+        "English):\n"
+        f"{dossie_texto}\n\n"
+        "HOW TO USE THE DOSSIER (hard rules):\n"
+        "- The story you tell must be the one in the dossier. Any fact, "
+        "event, date or number NOT in here is something you do not know - "
+        "leave it out, or write it generically with no number. Never fill "
+        "a gap with something merely plausible.\n"
+        "- The headlines prove an event happened on that date, nothing "
+        "more. Do not invent the article's content from its title: if a "
+        "headline says 'company sued', do not write the lawsuit's value or "
+        "the judge's name.\n"
+        "- Do not copy sentences from Wikipedia. Rewrite everything in "
+        "spoken language - this text will be narrated, not read.\n"
+        "- Keep marking [VERIFICAR] on specific numbers, including the "
+        "ones taken from the dossier. It is a secondary source: it keeps "
+        "you from inventing, it does not replace the final check.\n"
+        "- If the dossier contradicts the TOPIC, follow the dossier and "
+        "adjust the angle."
+    )
+
+
+def bloco_dossie_para_prompt(dossie_texto):
+    """Mesmo dossiê, instruções no idioma em que o roteiro está sendo
+    escrito."""
+    if not dossie_texto:
+        return ""
+    if GERAR_EM_INGLES:
+        return _instrucoes_do_dossie_en(dossie_texto)
+    return _instrucoes_do_dossie_pt(dossie_texto)
+
+
+def _variantes_do_numero(trecho):
+    """'R$ 2,5 bilhões' -> procura por '2,5' e '2.5' no dossiê. Vírgula e
+    ponto decimal trocam de lugar entre fonte brasileira e internacional,
+    e o mesmo número aparece das duas formas."""
+    digitos = re.search(r"\d[\d.,]*", trecho)
+    if not digitos:
+        return []
+    bruto = digitos.group(0).rstrip(".,")
+    variantes = {bruto, bruto.replace(",", "."), bruto.replace(".", ",")}
+    # 1.200 e 1200 são o mesmo número escrito de dois jeitos
+    if re.fullmatch(r"\d{1,3}(?:[.,]\d{3})+", bruto):
+        variantes.add(re.sub(r"[.,]", "", bruto))
+    return [v for v in variantes if v]
+
+
+def conferir_numeros_contra_dossie(roteiro, dossie):
+    """
+    Cruza cada número do roteiro com o material levantado e devolve uma
+    lista de {trecho, confere, linha}.
+
+    É o começo da pendência "agente que verifica os [VERIFICAR]" - e é
+    honesto sobre o que faz: diz se o número APARECE no material
+    pesquisado, não se a afirmação é verdadeira no contexto. Um número
+    que não aparece em lugar nenhum do dossiê é quase sempre invenção do
+    modelo, e é nele que sua revisão tem que começar.
+    """
+    if not dossie or not roteiro:
+        return []
+
+    dossie_texto = dossie.get("texto", "")
+    conferencias = []
+    vistos = set()
+    for linha in roteiro.splitlines():
+        if not _INICIO_LINHA_NARRACAO.match(linha):
+            continue
+        corte = linha.upper().find("VISUAL:")
+        narrada = linha if corte == -1 else linha[:corte]
+        for achado in _PADRAO_NUMERO_ESPECIFICO.finditer(narrada):
+            trecho = achado.group(0).strip()
+            if trecho in vistos:
+                continue
+            vistos.add(trecho)
+            confere = False
+            for variante in _variantes_do_numero(trecho):
+                if re.search(rf"(?<!\d){re.escape(variante)}(?!\d)", dossie_texto):
+                    confere = True
+                    break
+            conferencias.append({
+                "trecho": trecho,
+                "confere": confere,
+                "linha": narrada.strip()[:160],
+            })
+    return conferencias
+
+
+def montar_checklist_verificar(conferencias, fontes):
+    """Texto pronto pro relatório: o que bate com o dossiê e o que
+    apareceu do nada, que é onde sua revisão começa."""
+    if not conferencias:
+        return ""
+    batem = [c for c in conferencias if c["confere"]]
+    nao_batem = [c for c in conferencias if not c["confere"]]
+
+    linhas = [
+        f"{len(conferencias)} número(s) específico(s) no roteiro. "
+        f"{len(batem)} aparece(m) no material pesquisado, "
+        f"{len(nao_batem)} NÃO aparece(m).",
+        "",
+        "ATENÇÃO: 'aparece no material' não é o mesmo que 'está certo no "
+        "contexto' - o dossiê é fonte secundária. Mas todo número da "
+        "segunda lista veio da memória do modelo, sem nenhum respaldo: é "
+        "por eles que a revisão tem que começar.",
+        "",
+    ]
+    if nao_batem:
+        linhas.append("SEM RESPALDO NO DOSSIÊ (confira um por um):")
+        for item in nao_batem:
+            linhas.append(f"  [ ] {item['trecho']}  ->  {item['linha']}")
+        linhas.append("")
+    if batem:
+        linhas.append("APARECEM NO MATERIAL PESQUISADO (confirme a leitura):")
+        for item in batem:
+            linhas.append(f"  [ok] {item['trecho']}  ->  {item['linha']}")
+        linhas.append("")
+    if fontes:
+        linhas.append("FONTES CONSULTADAS:")
+        linhas.extend(f"  - {f}" for f in fontes)
+    return "\n".join(linhas)
+
+
+# =========================================================================
 # AGENTE 2 - ROTEIRISTA
 # =========================================================================
 
-def escrever_roteiro(tema, roteiro_anterior=None, mudancas_obrigatorias=None, historico_mudancas=None):
+def escrever_roteiro(tema, roteiro_anterior=None, mudancas_obrigatorias=None,
+                    historico_mudancas=None, dossie=None):
     template = ROTEIRO_PROMPT_EN if GERAR_EM_INGLES else ROTEIRO_PROMPT
     prompt = template.format(tema=tema)
+    # Na primeira escrita o dossiê vai inteiro; numa revisão o prompt já
+    # carrega o roteiro anterior (até 14k caracteres) mais o histórico de
+    # pedidos, então o dossiê entra na versão curta pra não estourar a
+    # janela de contexto do modelo local.
+    if dossie:
+        limite = (
+            PESQUISA_MAX_CHARS_DOSSIE_CURTO if roteiro_anterior
+            else PESQUISA_MAX_CHARS_DOSSIE
+        )
+        prompt += bloco_dossie_para_prompt(texto_do_dossie(dossie, limite))
     prompt += gerar_reforco_por_aprendizado()
     if roteiro_anterior and mudancas_obrigatorias:
         prompt += (
@@ -1759,7 +2421,7 @@ def escrever_roteiro(tema, roteiro_anterior=None, mudancas_obrigatorias=None, hi
 # AGENTE 3 - CRÍTICO
 # =========================================================================
 
-def avaliar_roteiro(roteiro, mudancas_pedidas_antes=None):
+def avaliar_roteiro(roteiro, mudancas_pedidas_antes=None, dossie=None):
     template = AVALIACAO_PROMPT_EN if GERAR_EM_INGLES else AVALIACAO_PROMPT
     # O roteiro vai inteiro pro prompt, e foi aqui que a API recusou o
     # pedido com 'context_length_exceeded' quando um roteiro veio
@@ -1767,6 +2429,22 @@ def avaliar_roteiro(roteiro, mudancas_pedidas_antes=None):
     # palavras (uns 12k caracteres com as linhas VISUAL), então 20k dá
     # folga confortável e ainda barra o caso patológico.
     prompt = template.format(roteiro=_truncar(roteiro, 20000, "roteiro"))
+    if dossie:
+        # Com o dossiê em mãos o campo "EVENTO SEM VERIFICAR" deixa de ser
+        # um chute: dá pra dizer se aquele evento existe no material
+        # levantado ou se o roteiro inventou.
+        prompt += (
+            "\n\nDOSSIÊ USADO PELO ROTEIRISTA (fontes abertas, levantado "
+            "antes da escrita):\n"
+            f"{texto_do_dossie(dossie, PESQUISA_MAX_CHARS_DOSSIE_CURTO)}\n\n"
+            "COMO ISSO MUDA SUA AVALIAÇÃO: evento que aparece no dossiê "
+            "está respaldado - não liste em EVENTO SEM VERIFICAR só por "
+            "não ter marcador. Evento que NÃO aparece no dossiê e não é "
+            "de conhecimento público amplo é o caso grave: provavelmente "
+            "foi inventado, e aí sim entra no campo. O dossiê pode estar "
+            "incompleto, então na dúvida prefira mandar marcar [VERIFICAR] "
+            "a mandar apagar o trecho."
+        )
     if mudancas_pedidas_antes and not mudancas_sao_vazias(mudancas_pedidas_antes):
         prompt += (
             "\n\nCONTEXTO: na rodada de avaliação ANTERIOR, você (ou outra "
@@ -2754,7 +3432,24 @@ def _qualidade_da_tentativa(veredito, mudancas, roteiro):
     )
 
 
-def gerar_video_completo(tema, max_tentativas=4):
+def gerar_video_completo(tema, max_tentativas=4, pesquisar=None):
+    # A pesquisa roda UMA vez, antes da primeira escrita: o material é o
+    # mesmo pra todas as tentativas do loop.
+    if pesquisar is None:
+        pesquisar = USAR_PESQUISA_DE_FATOS
+    dossie = None
+    if pesquisar:
+        # Pesquisa é melhoria, não pré-requisito: qualquer falha aqui
+        # (sem internet, fonte fora do ar, resposta estranha) não pode
+        # impedir o vídeo de ser gerado.
+        try:
+            dossie = pesquisar_dossie(tema)
+        except Exception as erro:
+            print(
+                f"  Aviso: a pesquisa de fatos falhou ({type(erro).__name__}: "
+                f"{erro}) - seguindo sem dossiê."
+            )
+
     mudancas = None
     roteiro = None
     avaliacao = None
@@ -2774,6 +3469,7 @@ def gerar_video_completo(tema, max_tentativas=4):
             roteiro_anterior=roteiro,
             mudancas_obrigatorias=mudancas,
             historico_mudancas=historico_mudancas,
+            dossie=dossie,
         )
 
         # Validação: já aconteceu de o roteirista devolver algo vazio ou
@@ -2788,7 +3484,9 @@ def gerar_video_completo(tema, max_tentativas=4):
                 f"(só {roteiro.count('NARRAÇÃO:')} linha(s) NARRAÇÃO:) - "
                 "gerando de novo antes de avaliar..."
             )
-            roteiro = escrever_roteiro(tema, roteiro_anterior=None, mudancas_obrigatorias=None)
+            roteiro = escrever_roteiro(
+                tema, roteiro_anterior=None, mudancas_obrigatorias=None, dossie=dossie
+            )
             if roteiro.count("NARRAÇÃO:") < 3:
                 print("    Aviso: segunda tentativa também veio inválida - avaliando mesmo assim.")
 
@@ -2812,7 +3510,7 @@ def gerar_video_completo(tema, max_tentativas=4):
             print(f"    +{numeros_pos_expansao} número(s) marcados após a expansão.")
 
         print("  Avaliando roteiro...")
-        avaliacao = avaliar_roteiro(roteiro, mudancas_pedidas_antes=mudancas)
+        avaliacao = avaliar_roteiro(roteiro, mudancas_pedidas_antes=mudancas, dossie=dossie)
         veredito = extrair_veredito(avaliacao)
         mudancas_brutas = extrair_mudancas_obrigatorias(avaliacao)
         registrar_aprendizado(avaliacao)
@@ -2945,6 +3643,20 @@ def gerar_video_completo(tema, max_tentativas=4):
             if remarcados:
                 print(f"    {remarcados} número(s) remarcados com [VERIFICAR] após a tradução.")
 
+    # Cruza os números do roteiro final com o material pesquisado - a
+    # lista de "não aparece em lugar nenhum" é por onde sua revisão começa.
+    conferencias = conferir_numeros_contra_dossie(roteiro, dossie)
+    checklist = montar_checklist_verificar(
+        conferencias, dossie.get("fontes", []) if dossie else []
+    )
+    if conferencias:
+        sem_respaldo = sum(1 for c in conferencias if not c["confere"])
+        print(
+            f"  Conferência dos números: {len(conferencias) - sem_respaldo} de "
+            f"{len(conferencias)} aparecem no material pesquisado; "
+            f"{sem_respaldo} sem respaldo (veja o checklist no .txt)."
+        )
+
     print("Buscando b-roll correspondente no Pexels...")
     broll = montar_lista_broll(roteiro)
 
@@ -2962,6 +3674,8 @@ def gerar_video_completo(tema, max_tentativas=4):
         "avaliacao": avaliacao,
         "historico_revisoes": historico,
         "pendencias_manuais": pendencias_manuais,
+        "dossie": dossie,
+        "checklist_verificar": checklist,
         "broll": broll,
         "metadados": metadados,
         "prompt_imagem_gemini": prompt_imagem,
@@ -3384,6 +4098,18 @@ def montar_relatorio_txt(resultado):
         "marcações, então é sua última chance de conferir os fatos.\n"
     )
     partes.append(extrair_narracao_limpa(resultado["roteiro"]))
+
+    if resultado.get("checklist_verificar"):
+        partes.append("\n\n" + "=" * 70)
+        partes.append("### CHECKLIST DE REVISÃO DOS NÚMEROS ###\n")
+        partes.append(resultado["checklist_verificar"])
+
+    if resultado.get("dossie"):
+        partes.append("\n\n" + "=" * 70)
+        partes.append(
+            "### DOSSIÊ DE PESQUISA (o material que o roteirista leu) ###\n"
+        )
+        partes.append(resultado["dossie"]["texto"])
 
     partes.append("\n\n" + "=" * 70)
     partes.append("### AVALIAÇÃO DO CRÍTICO (última rodada) ###\n")

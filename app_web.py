@@ -100,6 +100,18 @@ with aba_novo:
             tema_escolhido = tema_manual
 
         st.divider()
+        pesquisar = st.checkbox(
+            "🔎 Pesquisar fatos sobre o tema antes de escrever (recomendado)",
+            value=pipe.USAR_PESQUISA_DE_FATOS,
+            help=(
+                "Levanta material real sobre o tema (Wikipédia, Wikidata e "
+                "manchetes com data) e entrega pro roteirista antes dele "
+                "escrever, pra ele contar uma história que existe em vez de "
+                "uma história plausível. Não usa chave de API, leva alguns "
+                "segundos e fica em cache. Desligue só se estiver sem "
+                "internet."
+            ),
+        )
         gerar = st.button(
             "🚀 Gerar roteiro completo",
             type="primary",
@@ -127,7 +139,9 @@ with aba_novo:
 
                 builtins.print = print_capturado
                 try:
-                    resultado = pipe.gerar_video_completo(tema_escolhido)
+                    resultado = pipe.gerar_video_completo(
+                        tema_escolhido, pesquisar=pesquisar
+                    )
                 finally:
                     builtins.print = print_original
 
@@ -201,6 +215,25 @@ with aba_novo:
             resultado["narracao_limpa"],
             height=300,
         )
+
+        if resultado.get("checklist_verificar"):
+            sem_respaldo = [
+                c for c in pipe.conferir_numeros_contra_dossie(
+                    resultado["roteiro"], resultado.get("dossie")
+                ) if not c["confere"]
+            ]
+            titulo_checklist = (
+                f"🔎 Checklist dos números - {len(sem_respaldo)} sem respaldo "
+                "no material pesquisado"
+            )
+            with st.expander(titulo_checklist, expanded=bool(sem_respaldo)):
+                st.text(resultado["checklist_verificar"])
+
+        if resultado.get("dossie"):
+            with st.expander("📚 Dossiê de pesquisa (o que o roteirista leu)"):
+                for fonte in resultado["dossie"].get("fontes", []):
+                    st.markdown(f"- {fonte}")
+                st.text(resultado["dossie"]["texto"])
 
         with st.expander("Ver roteiro completo, com marcações [VERIFICAR]"):
             st.text(resultado["roteiro"])

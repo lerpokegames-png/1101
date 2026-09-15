@@ -11,3 +11,6 @@ __pycache__/
 
 # Estatísticas de aprendizado (estado local, muda a cada execução)
 .estatisticas_aprendizado.json
+
+# Cache do agente de pesquisa (dossiês baixados)
+.cache_pesquisa/
