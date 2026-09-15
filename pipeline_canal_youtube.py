@@ -3,12 +3,14 @@ Pipeline de criação de roteiros para YouTube - nicho empresas/administração
 ============================================================================
 
 4 AGENTES:
-1. Pesquisador  -> busca assuntos em alta (Google News RSS, sem chave de API).
-    DESLIGADO por padrão: manchete de jornal quase nunca vira tema bom aqui
-    (vem com nome do veículo colado, é notícia do dia, não evergreen). Pra
-    voltar a ver esses temas na lista, mude USAR_TEMAS_DE_NOTICIA pra True.
+1. Pesquisador  -> função pesquisar_temas_em_alta() continua no código, mas
+    NÃO é chamada em lugar nenhum do fluxo interativo - manchete de jornal
+    quase nunca vira tema bom aqui (vem com nome do veículo colado, é
+    notícia do dia, não evergreen), e na prática o tema sempre acaba
+    vindo do agente de Referência (1B) mesmo. Se um dia quiser usá-la,
+    é só chamar a função e juntar o resultado a todos_temas no __main__.
 1B. Referência  -> busca os vídeos mais vistos de canais de referência do
-    nicho (Elementar, Primo Rico, Nerds de Negócios) via API do YouTube, e
+    nicho (Elementar) via API do YouTube, e
     gera temas novos inspirados no padrão deles
 2. Roteirista   -> escreve o roteiro (LLM local via Ollama)
 3. Crítico      -> avalia e reprova/aprova, devolvendo feedback pro roteirista
@@ -19,6 +21,22 @@ Pipeline de criação de roteiros para YouTube - nicho empresas/administração
 7. Narração      -> gera o áudio final via ElevenLabs, com pausas naturais
    entre parágrafos (não é grátis - precisa de ELEVENLABS_API_KEY e
    ELEVENLABS_VOICE_ID no .env; sem isso, só pula essa etapa)
+
+LOOP DE REVISÃO (roteirista <-> crítico) - por que ele termina:
+    O loop já travou em roteiro bom por motivo que o roteirista não tinha
+    como resolver. Quatro regras garantem que ele converge:
+    a) o que é mecânico, o CÓDIGO faz - marcar_verificar_automatico()
+       coloca [VERIFICAR] em todo número específico antes da avaliação
+       (era 88% das reprovações, e nunca dependeu de julgamento);
+    b) roteiro curto é EXPANDIDO antes de ser avaliado, não depois - um
+       esqueleto de 300 palavras seria reprovado por falta de bloco em
+       todas as tentativas, sem chance de melhorar;
+    c) só reprova o roteiro o pedido que o roteirista consegue executar -
+       sugestão ("considere...") e pedido de pesquisa ("verifique a
+       veracidade", que ele não tem como fazer) não bloqueiam mais;
+    d) se o crítico repete o MESMO pedido 3 vezes, o loop para e entrega
+       a melhor versão do run com a pendência anotada, em vez de queimar
+       tentativa e devolver a última versão só por ser a última.
 
 CUSTO: R$ 0,00 nos agentes 1 a 6 (nuvem Groq ou local Ollama, ambos grátis).
 Busca de b-roll (Pexels) e YouTube Data API são grátis mas sempre usam
@@ -119,7 +137,19 @@ else:
 #   3. Confira o nome exato de um modelo gratuito atual em
 #      console.groq.com/dashboard/limits (a lista muda com frequência)
 
-USAR_NUVEM = True  # True = usa Groq | False = volta pro Ollama 100% local
+# False = Ollama 100% local (sem cota, sem internet, mas modelo bem mais
+# fraco e mais lento). True = Groq na nuvem (modelo forte, mas depende de
+# cota diária). Dá pra alternar a qualquer momento mudando só esta linha.
+#
+# ATENÇÃO ao voltar pro local: nos testes anteriores desta conversa, o
+# modelo de 7B mostrou limite real pra este tipo de tarefa - roteiro
+# saindo curto mesmo com instrução explícita de tamanho, e crítico
+# repetindo reprovação genérica sem avaliar o conteúdo de verdade. Foi
+# exatamente por isso que migramos pra nuvem. Como o pipeline ganhou
+# várias travas desde então (validação de roteiro vazio, escalação após
+# 2 reprovações, passe de expansão), pode ser que agora renda melhor -
+# mas não espere a mesma qualidade do gpt-oss-120b.
+USAR_NUVEM = False  # True = usa Groq | False = volta pro Ollama 100% local
 
 GROQ_KEY = os.getenv("GROQ_API_KEY", "")
 # ATENÇÃO: o Groq descontinua/muda modelos gratuitos com muita frequência -
@@ -139,10 +169,26 @@ MODELOS_GROQ_FALLBACK = [
     "openai/gpt-oss-20b",   # substitui llama-3.1-8b-instant (mais leve/rápido)
 ]
 
-# Ollama expõe uma API compatível com o formato OpenAI - só aponta o
-# base_url pro servidor local. api_key pode ser qualquer texto, o Ollama
-# não valida.
-client_local = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+# O Ollama expõe uma API compatível com OpenAI em /v1, mas NÃO usamos
+# ela: aquele endpoint ignora o num_ctx e trunca o prompt em 4096 tokens
+# silenciosamente (ver comentário grande em _chamar_ollama_nativo). Toda
+# chamada local vai pelo endpoint nativo /api/chat, via requests.
+OLLAMA_BASE_URL = "http://localhost:11434"
+
+# Janela de contexto pedida ao Ollama. O padrão do daemon (2048-4096) NÃO
+# cabe os prompts deste pipeline - o do crítico embute o roteiro inteiro e
+# passa de 8.000 tokens. 16384 dá folga.
+# CUSTO EM VRAM: contexto maior consome mais memória de vídeo. Na sua RTX
+# 3050 de 6GB, um modelo 7B em Q4 com 16k de contexto deve caber, mas é
+# apertado - se o Ollama começar a jogar camadas pra CPU (fica MUITO mais
+# lento) ou der erro de memória, baixe pra 12288 ou 8192.
+OLLAMA_NUM_CTX = 16384
+
+# Modelo local rodando na CPU/GPU da sua máquina é bem mais lento que a
+# nuvem: um roteiro longo pode levar vários minutos. Timeout generoso pra
+# não cortar no meio de uma geração legítima.
+OLLAMA_TIMEOUT_S = 900
+
 client_groq = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=GROQ_KEY) if GROQ_KEY else None
 
 # Precisa ser exatamente o nome que você baixou com "ollama pull"
@@ -157,11 +203,39 @@ YOUTUBE_KEY = os.getenv("YOUTUBE_API_KEY", "")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 # Pega o voice_id em elevenlabs.io/app/voice-library (escolha uma voz ou
 # use a sua clonada, se tiver) - fica no painel de detalhes da voz.
-ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
-# Multilingual v2 é o recomendado pra narração longa em PT-BR - mais
-# estável em textos longos que o v3 (que também é mais caro e limitado a
-# 5.000 caracteres por chamada).
-ELEVENLABS_MODEL = "eleven_multilingual_v2"
+#
+# RECOMENDAÇÕES DE VOZ PESQUISADAS (confira e ouça antes de decidir - gosto
+# de voz é subjetivo, isso é só um ponto de partida):
+# - "Dan" (voice_id: BHr135B5EUBtaWheVj8S) - recomendação OFICIAL da
+#   própria ElevenLabs especificamente pro gênero documentário/investigação
+#   (blog oficial deles). Voz em inglês original, mas funciona em português
+#   via Multilingual v2/Flash - teste o sotaque antes de decidir.
+# - Outras vozes NATIVAS em português brasileiro que apareceram como boas
+#   pra narração/documentário (procure pelo nome na Voice Library e copie
+#   o voice_id de lá - não colei os IDs aqui porque a fonte que listei
+#   tinha nome e ID desalinhados, e ID errado = voz errada gastando
+#   crédito): "Adriano - Narrator" (voz grave, storytelling),
+#   "Eduardo Hubi" (voz calma, passa credibilidade),
+#   "Marcelo Costa_Brasileiro", "Victor Power - Ebooks".
+#
+# ESCOLHIDA: "Cassio Cruz" - voz masculina brasileira grave, descrita como
+# boa pra narração de documentário. O ID abaixo foi conferido por você
+# direto no painel da ElevenLabs (não é chute meu). Continua podendo ser
+# sobrescrito pelo .env se quiser testar outra voz sem mexer no código.
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "TbxkrwWBTzuT49yXcfss")
+
+# Escolhi o Flash (mais barato, $0,05/1k caracteres - metade do preço da
+# Multilingual v2) por pedido explícito, sabendo do trade-off real: toda
+# fonte que pesquisei (doc oficial, reviews independentes) concorda que a
+# Multilingual v2 tem prosódia mais refinada em narração longa - "a
+# diferença é audível, principalmente em passagens longas, no ritmo e na
+# ênfase" foi a frase exata de uma delas. Compensei subindo um pouco mais
+# o "style" no voice_settings abaixo pra tentar recuperar parte dessa
+# expressividade, mas não testei se compensa de verdade - ouça o resultado
+# e, se sentir mais robótico que antes, troque essa linha de volta pra
+# "eleven_multilingual_v2" (custa o dobro, mas foi o que testamos e
+# funcionou na análise de pitch anterior).
+ELEVENLABS_MODEL = "eleven_flash_v2_5"
 
 # Termos com pronúncia problemática - ADICIONE AQUI conforme for notando na
 # prática (sigla, nome de marca, palavra estrangeira). O valor é como você
@@ -178,6 +252,40 @@ REGRAS_PRONUNCIA_ELEVENLABS = {
 }
 CAMINHO_CACHE_DICIONARIO = PASTA_DO_SCRIPT / ".pronuncia_dict_cache.json"
 
+# Arquivo que acumula, entre TODAS as execuções (não só a atual), quais
+# problemas o crítico mais aponta - usado pra reforçar automaticamente
+# esses pontos específicos no prompt do roteirista. Não é "aprendizado de
+# máquina" de verdade (o modelo não é retreinado) - é um contador de
+# padrões de erro que se repetem, alimentando o próprio prompt sozinho.
+CAMINHO_ESTATISTICAS_APRENDIZADO = PASTA_DO_SCRIPT / ".estatisticas_aprendizado.json"
+
+# Campos do template de avaliação que indicam um problema real quando
+# preenchidos (o valor "vazio" de cada um varia - por isso a checagem
+# fica em _campo_indica_problema, não aqui)
+_CAMPOS_PROBLEMA_APRENDIZADO = (
+    "MINI-GANCHOS FALTANDO",
+    "JARGÃO NÃO EXPLICADO",
+    "VISUAIS PROBLEMÁTICOS",
+    "RÓTULO DE INSTRUÇÃO VAZADO",
+    "NÚMEROS SEM VERIFICAR",
+    "PESSOA INVENTADA",
+    "EVENTO SEM VERIFICAR",
+    "EMPRESA IDENTIFICÁVEL MAS NÃO NOMEADA",
+)
+
+# =========================================================================
+# ESQUEMA "ESCREVER EM INGLÊS" - roteirista e crítico trabalham em inglês
+# (modelos costumam seguir regra complexa melhor em inglês do que em
+# português), e só no final um agente de tradução converte pra português
+# falado natural. Os RÓTULOS de estrutura (NARRAÇÃO:, VISUAL:, [VERIFICAR],
+# [ARQUIVO REAL], nomes dos campos do crítico) continuam SEMPRE em
+# português, em inglês ou não - isso é só uma marcação fixa que o código
+# procura por regex, não precisa mudar de idioma junto com o conteúdo.
+# Isso mantém toda a extração de b-roll/palavras/veredito funcionando
+# sem alteração nenhuma, o único agente novo é o de tradução no final.
+# =========================================================================
+GERAR_EM_INGLES = True  # False = volta pro fluxo 100% em português direto
+
 # Canais de referência do nicho pra puxar inspiração dos vídeos que mais
 # renderam. Handles confirmados (conferidos por busca, não chutados):
 # - Elementar: documentário narrativo de empresas/negócios (o mais próximo
@@ -185,15 +293,7 @@ CAMINHO_CACHE_DICIONARIO = PASTA_DO_SCRIPT / ".pronuncia_dict_cache.json"
 # - primorico: Primo Rico (Thiago Nigro), finanças/investimentos
 # - NerdsdeNegocios: Peter Jordan, maior canal de empreendedorismo do Brasil
 # Use o handle exatamente como aparece na URL do canal (youtube.com/@handle).
-CANAIS_REFERENCIA = ["Elementar", "primorico", "NerdsdeNegocios"]
-
-# Manchete de Google News quase nunca vira tema bom aqui: vem com nome de
-# jornal colado no fim, é notícia do dia (não evergreen) e concorre com os
-# temas gerados a partir dos canais de referência, que é o que você acaba
-# escolhendo na prática. Por isso o pipeline não busca mais notícia por
-# padrão - a função pesquisar_temas_em_alta() continua no código e volta
-# à lista de candidatos se você mudar isto pra True.
-USAR_TEMAS_DE_NOTICIA = False
+CANAIS_REFERENCIA = ["Elementar"]
 
 
 # =========================================================================
@@ -201,8 +301,7 @@ USAR_TEMAS_DE_NOTICIA = False
 # =========================================================================
 
 ROTEIRO_PROMPT = """Você é um roteirista de vídeos de YouTube sobre empresas e administração,
-estilo documentário narrativo (referência: Elementar, Primo Rico, Nerds de
-Negócios). Canal faceless, narrado em primeira pessoa. Siga as instruções
+estilo documentário narrativo (referência: Elementar. Canal faceless, narrado em primeira pessoa. Siga as instruções
 abaixo na ordem exata. Não pule nenhum passo.
 
 TEMA: {tema}
@@ -395,8 +494,11 @@ Antes de preencher o template, confira estes 5 pontos no roteiro:
    roteiro pode ter 15, 20 ou mais. Para CADA linha NARRAÇÃO, pergunte:
    tem percentual, R$/US$, quantidade de pessoas, ou data exata aqui? Se
    sim, tem [VERIFICAR] do lado, OU é fato público muito conhecido (ex:
-   ano de fundação de empresa famosa)? Liste TODOS os que não tiverem,
-   não só os 2-3 primeiros que achar. Se houver 3 ou mais números
+   ano de fundação de empresa famosa)? IMPORTANTE: um [VERIFICAR] em
+   qualquer ponto próximo da MESMA linha NARRAÇÃO já marca o número -
+   não exija um marcador colado em cada algarismo, e não liste como
+   problema um número que já tem [VERIFICAR] na linha. Liste TODOS os
+   que realmente não tiverem, não só os 2-3 primeiros que achar. Se houver 3 ou mais números
    específicos sem [VERIFICAR] e sem ser fato muito conhecido, isso é um
    problema GRAVE - roteiro pode estar inventando estatística sobre
    empresa real, o que é pior que qualquer problema de ritmo ou gancho.
@@ -434,17 +536,413 @@ início. Ou escreva "Nenhum encontrado"]
 PESSOA INVENTADA: [cite nome e trecho se houver pessoa comum (não figura
 pública) citada com nome próprio, ou escreva "Nenhuma encontrada"]
 
+EVENTO SEM VERIFICAR: [liste TODO EVENTO narrativo apresentado como fato
+que esteja sem [VERIFICAR] e não seja de conhecimento público amplo -
+processo, investigação, relatório de órgão de defesa do consumidor, vídeo
+viral, coletiva de imprensa, reunião de diretoria, decisão interna,
+mudança de política. Isto NÃO é sobre número (esse é o campo acima) - é
+sobre a HISTÓRIA EM SI possivelmente ser inventada. Falha real que já
+aconteceu: um roteiro descreveu um relatório de defesa do consumidor, um
+vídeo viral no TikTok e um debate interno da diretoria, todos com datas
+confiantes, nenhum marcado - como os números estavam todos marcados, foi
+aprovado, e o ENREDO INTEIRO era ficção não verificada sobre uma empresa
+real. Marque especialmente qualquer trecho que impute MÁ-FÉ DELIBERADA
+(mirar usuários silenciosamente, esconder taxas de propósito, refinar
+algoritmos pra explorar) - isso é acusação, não descrição, e sempre precisa
+de [VERIFICAR]. Ou escreva "Nenhum encontrado"]
+
+EMPRESA IDENTIFICÁVEL MAS NÃO NOMEADA: [o roteiro tem que nomear a empresa
+real no corpo do texto. Se ele evita o nome mas acumula detalhes que
+identificam uma empresa específica mesmo assim (ano de fundação + setor +
+rodada de captação + data do IPO + avaliação), isso é o pior dos dois
+mundos: não tem a proteção de discussão genérica e ainda quebra a regra de
+nomear. Cite os detalhes identificadores se isso acontecer, ou escreva
+"Nenhum encontrado"]
+
 CHANCE DE RETENÇÃO: [baixa / média / alta]
 
 MUDANÇAS OBRIGATÓRIAS: [lista objetiva do que mudar, só o essencial - se
 houver qualquer item nos campos "RÓTULO DE INSTRUÇÃO VAZADO", "NÚMEROS
-SEM VERIFICAR" ou "PESSOA INVENTADA", ele SEMPRE entra aqui como
-obrigatório, sem exceção. Se não houver nada obrigatório, escreva "Nenhuma"]
+SEM VERIFICAR", "PESSOA INVENTADA", "EVENTO SEM VERIFICAR" ou "EMPRESA
+IDENTIFICÁVEL MAS NÃO NOMEADA", ele SEMPRE entra aqui como
+obrigatório, sem exceção. Se não houver nada obrigatório, escreva "Nenhuma".
+
+COMO ESCREVER CADA ITEM (regra dura - quem lê isto é o roteirista, que só
+sabe mexer no texto e não tem como pesquisar nada):
+- Um item por linha, começando com VERBO NO IMPERATIVO (Adicione, Remova,
+  Troque, Reescreva, Nomeie) e dizendo ONDE mexer.
+- PROIBIDO copiar pra cá uma lista solta de dados. Escrever só
+  "R$ 2,5 bilhões, 24%, 2015, 2019" NÃO é uma mudança - o roteirista
+  recebe isso sem saber o que fazer e devolve o mesmo roteiro. A forma
+  certa é: "Adicione [VERIFICAR] ao lado de R$ 2,5 bilhões, 24% e 2019
+  nas linhas NARRAÇÃO em que aparecem".
+- PROIBIDO pedir "verifique a veracidade", "confirme a fonte" ou
+  "pesquise": o roteirista não tem acesso a fonte nenhuma. A única ação
+  equivalente que ele consegue executar é ADICIONAR [VERIFICAR] no
+  trecho - peça isso.
+- PROIBIDO escrever sugestão aqui ("considere", "seria bom", "poderia").
+  Este campo é só do que REPROVA o roteiro. Sugestão vai nos campos de
+  cima, não aqui.
+- Se o item já foi pedido numa rodada anterior e o roteirista atendeu,
+  NÃO repita. Repetir o mesmo pedido trava o roteiro no mesmo lugar.]
 
 VEREDITO: [escreva exatamente a palavra APROVADO se não houver nenhuma
 mudança obrigatória, ou exatamente a palavra REPROVADO se houver pelo menos
 uma mudança obrigatória. Escreva só essa palavra nesta linha, em maiúsculas,
 nada mais.]
+"""
+
+# =========================================================================
+# VERSÕES EM INGLÊS (roteirista e crítico) - mesmas regras do par acima,
+# mas escritas em inglês pra aproveitar o fato de que modelos costumam
+# seguir instrução complexa com mais precisão nesse idioma. Os RÓTULOS de
+# estrutura ficam em português DE PROPÓSITO (NARRAÇÃO:, VISUAL:,
+# [VERIFICAR], [ARQUIVO REAL], e os nomes de campo do crítico) - é só uma
+# marcação fixa que o código busca por regex, funciona igual em qualquer
+# idioma ao redor dela, e assim TODA a extração (b-roll, contagem de
+# palavra, veredito, aprendizado) continua funcionando sem nenhuma
+# alteração, seja o conteúdo em português ou em inglês.
+# =========================================================================
+
+ROTEIRO_PROMPT_EN = """You are a YouTube scriptwriter for a business/management channel, narrative
+documentary style (reference: Elementar). Faceless channel, narrated in
+first person PLURAL - the guided-tour voice: "repare no que acontece
+agora", "vamos aos números", "olha o tamanho disso", "agora segura essa".
+Use it deliberately, roughly once per block, to steer the viewer's
+attention at a turn in the story - NOT as decoration sprinkled at random.
+
+Two hard limits on this voice. First, NEVER first person SINGULAR: no "eu
+descobri", "eu fui atrás dos documentos", "na minha opinião". The
+narration voice is synthetic and the writer did no reporting - claiming
+personal investigation is a lie, and it turns every statement into a
+personal allegation by the channel owner. Second, the guiding voice never
+carries a factual claim by itself: "vamos aos números" is fine, "eu vi os
+números" is not.
+
+Follow the instructions below in exact order. Do not skip
+any step. Write your reasoning and the actual narration CONTENT in
+ENGLISH - but the STRUCTURE LABELS below must stay EXACTLY as shown, in
+Portuguese, never translated: "NARRAÇÃO:", "VISUAL:", "[VERIFICAR]",
+"[ARQUIVO REAL]". Do not write "NARRATION:" or "VISUAL DESCRIPTION:" or
+any English version of these labels - use the literal Portuguese tokens
+shown, with English text following them.
+
+TOPIC: {tema}
+
+DELIVERY RULES (very important - read carefully):
+- Your final answer must contain ONLY the script in the "NARRAÇÃO:"/
+  "VISUAL:" format, start to finish. Do NOT write a greeting, a comment
+  about the task, or phrases like "Understood" or "Here is". Do NOT
+  repeat the step names (STEP 1, BLOCK A, etc.) in the final answer -
+  they are only a reasoning guide for you, not part of the delivered text.
+- Do NOT write the script twice. Write it once, start to finish, and stop.
+- If the TOPIC above does not name a specific company (e.g. it is a
+  market/sector trend topic), YOU must pick ONE specific real company to
+  be the throughline of the story right in Step 1, and use its REAL NAME
+  throughout the script - never leave a blank or placeholder where the
+  company name should be. If you are not absolutely certain of a fact
+  about it, mark only that fact with [VERIFICAR], but the company NAME
+  itself never gets a marker.
+
+FIXED RULES (apply to the whole script):
+- Every suggested visual must EXIST in a free stock library (Pexels/
+  Envato/Storyblocks): meeting, office, factory, store shelf, city
+  traffic, money, on-screen chart, hands typing, paper being signed,
+  shipping container. NEVER describe a unique, specific scene that does
+  not exist ready-made (forbidden: "the CEO looking out the window that
+  day").
+- "[ARQUIVO REAL]" may ONLY appear alone on a "VISUAL:" line, never
+  inside the "NARRAÇÃO:" text, neither before nor after the word
+  "VISUAL:". Use "[ARQUIVO REAL]" on a VISUAL line when the video needs
+  something company-specific (logo, product, founder, building) that
+  only exists in press/archive photos, not in stock footage. This is an
+  editing instruction, not a substitute for the company name and never
+  something that appears in the narrated text. WRONG example (never do
+  this): "...paid off the debt on time. [ARQUIVO REAL] photo of the
+  contract VISUAL: generic b-roll of signing" - here [ARQUIVO REAL] is
+  inside the narration, which is FORBIDDEN. RIGHT example: the
+  "NARRAÇÃO:" line never mentions [ARQUIVO REAL] under any
+  circumstance; if that beat needs a real image, the matching VISUAL
+  line is just "VISUAL: [ARQUIVO REAL] photo of the restructuring
+  contract", nothing else.
+- Each "NARRAÇÃO:" line gets exactly ONE "VISUAL:" line after it, never
+  two visual markers for the same narration line.
+- FORBIDDEN to write, inside "NARRAÇÃO:" content, any instruction word
+  used in this prompt: "mini-hook", "block", "step", "backstory",
+  "core"/"miolo" must never appear in the narrated text - these are
+  concepts for you to apply, not labels to write out loud. WRONG example
+  (never do this): "The first mini-hook: the investigation revealed
+  that..." - same mistake as writing "STEP 1" in the middle of the
+  script. The mini-hook is just the fact/reveal itself, never announced
+  as one.
+- VERIFICATION RULE (the most important rule in this list - read
+  carefully): by default, mark [VERIFICAR] next to ANY specific number
+  about a real company - percentage, R$/US$ amount, headcount, item
+  count, exact date - UNLESS it is a widely known, easily checkable fact
+  (e.g. a famous company's founding year, who the founder is). You have
+  no way to research facts - so the safe default is to mark, not trust
+  your own memory. This applies even if the number seems plausible or
+  specific enough to feel real - "feeling real" is not the same as
+  "being verified". Real example of the mistake this rule exists to
+  prevent: a script about a company cited "200 thousand invoices
+  altered", "12% of transactions", "R$1.2 billion in lost revenue",
+  "15% workforce cut" and a dozen similar numbers - ALL without
+  [VERIFICAR], all possibly fabricated. That is a false factual claim
+  about a real company if not checked - the single worst error this
+  script can have, worse than any pacing or hook problem.
+- FORBIDDEN to invent an ordinary person: never create the name of an
+  employee, manager, customer, or meeting participant who is not a real,
+  well-known public figure (a famous founder/CEO, for example). Putting
+  words ("said that...") in the mouth of a made-up person is the same
+  severity of error as a number without [VERIFICAR] - it is a false
+  claim about a person nobody can verify. If you need to illustrate a
+  human reaction, describe it generically ("a restaurant manager
+  noticed that..."), never invent a proper name for that person.
+- Explain technical jargon (e.g. "M&A", "bank spread") only when it is
+  genuinely obscure to a layperson. Do NOT explain a word the audience
+  already understands from context (do not do this: "crisis committee,
+  which is an emergency management group", or "conference call, which
+  is an online meeting" - nobody needs that explained). And when you do
+  explain something, vary the phrasing - do not repeat the "X, which is
+  Y" formula every time, it sounds robotic when it happens several times
+  in the same script.
+- Short sentences, spoken language (this will be narrated aloud, not
+  read).
+- FORBIDDEN to use these stock phrases: "but nobody expected", "and
+  that's when everything changed", "but the story doesn't end there",
+  "but there was a problem".
+
+STEP 1 - DEFINE THE ANGLE (write this before the script itself, in up to
+2 sentences): Answer: what is the least obvious point of view on this
+topic? What question will keep someone watching until the end? Is there
+a twist or irony? If the topic does not name a company, say here which
+real company you chose for the story.
+
+STEP 2 - WRITE THE SCRIPT IN THIS ORDER AND THIS LENGTH:
+IMPORTANT: the ranges below are the MINIMUM acceptable, not the target.
+Always write near the TOP of each range, never the bottom - a script
+that is too short is the most common and most avoidable mistake.
+
+BLOCK A - INTRO (2 to 4 sentences, 60 to 90 words):
+Open with a number, claim, or strange situation. Do NOT say the company
+name or the ending yet. End the intro with an implied question (the
+viewer should be left wondering "so, what happened?").
+
+BLOCK B - BACKSTORY (280 to 350 words):
+Explain the setting as if the person knows nothing about the topic.
+Develop the context with detail - era, market, the people involved.
+Somewhere in the middle of this block, insert ONE fact, number, or odd
+detail that works as a mini-hook (example of a mini-hook: "and mind you,
+this was happening at a company that had nearly shut its doors three
+years earlier").
+
+BLOCK C - CORE / MIDDLE (750 to 950 words):
+Tell the central decision or conflict. Explain the management reasoning
+behind the decision (not just the fact, the WHY) - develop each step of
+the decision in detail, do not summarize. Insert at least THREE
+mini-hooks throughout this block (a new fact, small reveal, or question),
+roughly one every 200-250 words - do not save everything for the end.
+
+BLOCK D - CONNECTION TO THE FUTURE OR CONCLUSION (180 to 230 words):
+If the matter is still unfolding today: say what it signals for the
+future of the sector. If it is a closed case: write the central
+management lesson, without sounding like a bumper-sticker moral. End
+with an impactful line.
+
+STEP 3 - OUTPUT FORMAT (mandatory, follow this example exactly):
+Each sentence or paragraph of the script becomes a "NARRAÇÃO:" line
+followed, on a SEPARATE LINE (press Enter - never on the same line), by
+a "VISUAL:" line. Formatting example (do not copy the content, only the
+format - note NARRAÇÃO and VISUAL are ALWAYS two different lines, and
+the label itself stays in Portuguese exactly as written, English content
+follows it):
+
+NARRAÇÃO: In 2015, a company nearly went bankrupt with billions in debt.
+VISUAL: generic b-roll of a falling line chart on screen
+
+NARRAÇÃO: Five years later, it had become one of the biggest in the
+world in its sector.
+VISUAL: generic b-roll of a factory in operation, production line
+
+Repeat this pattern ("NARRAÇÃO:" on one line, "VISUAL:" on the next)
+start to finish, without skipping any sentence, and never merging the
+two onto one line. Do not use block titles (A, B, C, D) in the final
+text - they are only a writing guide for you, the result must read as
+one continuous narrated text.
+
+BEFORE ANSWERING, check: (1) does every line have "NARRAÇÃO:" and
+"VISUAL:" on SEPARATE lines, never merged? (2) does the company name
+stay out of the intro, but appear (real name, never a placeholder) in
+the rest of the script? (3) when used, is "[ARQUIVO REAL]" ONLY on the
+VISUAL line, never inside the narrated text? (4) are there at least 4
+mini-hooks total (1 in backstory + 3 in the core) - AND is the word
+"mini-hook" itself absent from every NARRAÇÃO line? (5) does the whole
+script add up to at least 1300 words of narration - if it's shorter, GO
+BACK and develop each block further, especially the CORE block? (6) did
+you write the script only ONCE, with no commentary and no repeated step
+names? (7) COUNT how many specific numbers (%, R$/US$, quantity, exact
+date) appear in the script - does each one have [VERIFICAR] next to it,
+except the ones that are widely known public facts? If any specific
+number lacks [VERIFICAR] and you are not absolutely certain of it, add
+it now. If any answer is no, fix it before delivering.
+"""
+
+AVALIACAO_PROMPT_EN = """You are a YouTube audience-retention critic, business/management niche,
+long-form video (not Shorts). Evaluate the script below following the
+response TEMPLATE at the end EXACTLY. Fill every field, skip none. Be
+direct - if something is weak, say it is weak. Write your reasoning in
+ENGLISH, but the response template's FIELD NAMES must stay EXACTLY as
+shown below, in Portuguese, never translated - only the content you
+write after each field name should be in English.
+
+SCRIPT TO EVALUATE:
+{roteiro}
+
+Before filling the template, check these 5 points in the script:
+1. Does the opening hook (first 2-4 sentences) reveal the company name
+   or the ending? If so, that is a problem.
+2. Does every block (backstory, core, conclusion) have at least one new
+   fact, reveal, or question (a mini-hook)? Or does the text just list
+   facts in sequence with nothing new holding attention?
+3. Is there any jargon from business/management left unexplained in
+   plain language right after it appears?
+4. Is the ending specific to this story, or could it be pasted into any
+   video on the channel (a generic line like "and that's the lesson
+   here")?
+5. Is there any spot where the visual description ("VISUAL:") looks like
+   a unique moment that does NOT exist ready-made in a stock library?
+   WARNING: the goal here is the OPPOSITE of what it seems -
+   "VISUAL: generic b-roll of..." is the CORRECT format and should never
+   be flagged as a problem, because stock libraries are full of generic
+   footage. The real problem is when the script asks for something
+   hyper-specific to the company (e.g. "VISUAL: photo of the CEO signing
+   THIS specific contract in 2016") without marking [ARQUIVO REAL] - that
+   is when you should flag it, and the fix is to ADD [ARQUIVO REAL] or
+   swap it for something MORE generic, never to ask for something even
+   more specific.
+6. Does the word "mini-hook" (or "block", "step", "backstory", "core")
+   appear literally WRITTEN inside a NARRAÇÃO line? This is always an
+   error - these are instruction concepts, never narrated text. Example
+   of the mistake: "The first mini-hook: the investigation revealed
+   that...".
+7. COUNT the specific numbers in the script. Do this for real, line by
+   line, start to finish - do NOT stop after finding 2 or 3, the script
+   may have 15, 20, or more. For EVERY NARRAÇÃO line, ask: is there a
+   percentage, R$/US$, headcount, or exact date here? If so, does it
+   have [VERIFICAR] next to it, OR is it a very well-known public fact
+   (e.g. a famous company's founding year)? IMPORTANT: a [VERIFICAR]
+   anywhere nearby on the SAME NARRAÇÃO line already marks the number -
+   do not demand one marker glued to every digit, and never list as a
+   problem a number that already has [VERIFICAR] on its line. List ALL
+   that genuinely lack it, not just the first 2-3 you find. If there are 3 or more specific numbers
+   without [VERIFICAR] and not a well-known fact, that is a SERIOUS
+   problem - the script may be fabricating statistics about a real
+   company, which is worse than any pacing or hook problem.
+8. Is there any ORDINARY PERSON NAMED by their real name (employee,
+   manager, customer, meeting participant) who is not a known public
+   figure (a CEO/founder)? Naming an ordinary person and putting speech
+   ("said that...") in their mouth is always fabrication, even without a
+   number attached - flag it as a serious problem, same severity as a
+   number without [VERIFICAR].
+9. Now check the EVENTS, not the numbers. Go line by line and ask of each
+   narrative beat: did this specific thing actually happen, and can a
+   viewer verify it? Reports, lawsuits, investigations, viral videos,
+   press conferences, internal meetings, strategy decisions - each is a
+   factual claim about a real company and needs [VERIFICAR] unless it is
+   widely known. A script can have every number marked and still be
+   entirely fabricated at the plot level; that exact failure already
+   happened here and was wrongly approved. Treat an unverified PLOT as
+   more serious than an unverified number, never less.
+10. Does the script avoid naming the company while still making it
+   obvious which one it is? Check whether founding year, sector, funding
+   rounds, IPO date and valuation together point at one identifiable
+   company. If so, flag it - the rule is to NAME the real company in the
+   body of the script, and half-anonymity gives no protection while
+   breaking that rule.
+
+RESPONSE TEMPLATE (fill exactly like this):
+
+NOTA DO GANCHO (0 a 10): [number]
+MOTIVO: [1-2 sentences]
+
+PONTOS DE QUEDA: [list each one found, format "Bloco X: [reason]". If
+none found, write "Nenhum encontrado".]
+
+MINI-GANCHOS FALTANDO: [list which block is missing a mini-hook, or
+write "Todos os blocos têm mini-gancho"]
+
+JARGÃO NÃO EXPLICADO: [quote the passage, or write "Nenhum encontrado"]
+
+FECHO: [specific or generic - justify in 1 sentence]
+
+VISUAIS PROBLEMÁTICOS: [quote the problematic VISUAL: line, or write
+"Nenhum encontrado"]
+
+RÓTULO DE INSTRUÇÃO VAZADO: [quote the line if "mini-gancho"/"bloco"/
+"passo" appears written in the narration, or write "Nenhum encontrado"]
+
+NÚMEROS SEM VERIFICAR: [list ALL specific numbers without [VERIFICAR]
+that are not a well-known fact - count the whole script, not just the
+start. Or write "Nenhum encontrado"]
+
+PESSOA INVENTADA: [quote name and passage if there is an ordinary person
+(not a public figure) named by a proper name, or write "Nenhuma
+encontrada"]
+
+EVENTO SEM VERIFICAR: [list EVERY narrative EVENT presented as fact that
+carries no [VERIFICAR] and is not common public knowledge - a lawsuit, an
+investigation, a consumer-group report, a viral video, a press release, a
+boardroom debate, an internal decision, a policy change. This is NOT about
+numbers (that is the field above) - it is about the STORY ITSELF being
+possibly invented. A real failure that happened: a script described a
+consumer watchdog report, a viral TikTok video, and an internal executive
+debate, all with confident dates, none marked - the numbers were all
+marked, so it was approved, and the entire PLOT was unverified fiction
+about a real company. Especially flag any passage imputing DELIBERATE BAD
+FAITH (quietly targeting users, hiding fees on purpose, refining
+algorithms to exploit) - that is an accusation, not a description, and
+always needs [VERIFICAR]. Or write "Nenhum encontrado"]
+
+EMPRESA IDENTIFICÁVEL MAS NÃO NOMEADA: [the script must name the real
+company in the body. If it avoids the name yet piles up details that
+identify one specific company anyway (founding year + sector + funding
+round + IPO date + valuation), that is the worst of both worlds: no
+generic-discussion protection, and the naming rule broken. Quote the
+identifying details if this happens, or write "Nenhum encontrado"]
+
+CHANCE DE RETENÇÃO: [baixa / média / alta]
+
+MUDANÇAS OBRIGATÓRIAS: [objective list of what to change, essentials
+only - if there is anything in the "RÓTULO DE INSTRUÇÃO VAZADO",
+"NÚMEROS SEM VERIFICAR", "PESSOA INVENTADA", "EVENTO SEM VERIFICAR" or
+"EMPRESA IDENTIFICÁVEL MAS NÃO NOMEADA" fields, it ALWAYS goes
+here as mandatory, no exception. If nothing is mandatory, write
+"Nenhuma".
+
+HOW TO WRITE EACH ITEM (hard rule - the reader is the scriptwriter, who
+can only edit text and cannot research anything):
+- One item per line, starting with an IMPERATIVE VERB (Add, Remove,
+  Replace, Rewrite, Name) and saying WHERE to act.
+- FORBIDDEN to paste a bare list of data here. Writing only
+  "R$ 2.5 billion, 24%, 2015, 2019" is NOT a change - the writer gets it
+  with no instruction and returns the same script. The correct form is:
+  "Add [VERIFICAR] next to R$ 2.5 billion, 24% and 2019 on the NARRAÇÃO
+  lines where they appear".
+- FORBIDDEN to ask to "verify the truth", "confirm the source" or
+  "research": the writer has no source access at all. The only equivalent
+  action he can perform is to ADD [VERIFICAR] to the passage - ask for
+  that instead.
+- FORBIDDEN to write a suggestion here ("consider", "it would be good",
+  "could"). This field is only what FAILS the script. Suggestions belong
+  in the fields above, not here.
+- If an item was already requested in an earlier round and the writer
+  complied, do NOT repeat it. Repeating the same request freezes the
+  script in place.]
+
+VEREDITO: [write exactly the word APROVADO if there is no mandatory
+change, or exactly the word REPROVADO if there is at least one
+mandatory change. Write only that word on this line, in uppercase,
+nothing else.]
 """
 
 METADADOS_PROMPT = """Você é especialista em metadados de YouTube (título, thumbnail, descrição,
@@ -612,6 +1110,56 @@ DICA DE USO: [1 frase com um ajuste prático - ex: gerar 2-3 variações e
 escolher a mais natural, ou reenviar pedindo pra suavizar se saiu exagerado]
 """
 
+TRADUCAO_PROMPT = """Você traduz um roteiro de vídeo de YouTube do inglês pro português brasileiro
+FALADO, não pro português escrito/literal. O objetivo final é uma
+narração de voz em áudio - a tradução tem que soar como alguém contando
+uma história em português, nunca como um texto traduzido palavra por
+palavra.
+
+ROTEIRO EM INGLÊS:
+{roteiro_ingles}
+
+REGRAS OBRIGATÓRIAS:
+- Traduza SÓ o conteúdo (o texto depois de cada "NARRAÇÃO:" e depois de
+  cada "VISUAL:"). NUNCA traduza os próprios rótulos "NARRAÇÃO:" e
+  "VISUAL:" - eles já estão em português e têm que continuar exatamente
+  assim, palavra por palavra, em cada linha.
+- Os marcadores "[VERIFICAR]" e "[ARQUIVO REAL]" são fixos - copie-os
+  exatamente onde aparecem, sem traduzir e sem mover de lugar dentro da
+  frase.
+- PROIBIDO mudar qualquer fato: nome de empresa, número, data, valor,
+  nome de pessoa pública têm que ser EXATAMENTE os mesmos do original,
+  só a língua muda. Isso inclui manter [VERIFICAR] exatamente nos mesmos
+  pontos - não remova a marcação achando que "já dá pra confiar", e não
+  adicione marcação nova em número que não tinha.
+- Mantenha o número de linhas EXATAMENTE igual: uma linha "NARRAÇÃO:" do
+  original vira UMA linha "NARRAÇÃO:" traduzida, nunca junte ou divida
+  frases - isso quebraria o casamento com a linha "VISUAL:" correspondente.
+- Escreva como se fosse falado em voz alta: frases curtas, conectivos
+  naturais em português ("só que", "e olha que", "no fim das contas"),
+  não a estrutura de frase do inglês traduzida ao pé da letra. Ajuste a
+  ordem das palavras, troque expressões idiomáticas por equivalentes em
+  português - o objetivo é soar como um brasileiro contando a história,
+  não como uma tradução.
+- Termos técnicos que o roteiro já tinha traduzido/explicado em inglês,
+  mantenha a mesma explicação, só em português.
+- PRESERVE a voz de primeira pessoa do PLURAL onde ela existir no
+  original ("vamos aos números", "repare nisso", "olha o tamanho disso").
+  Essa voz de guia é proposital, é o que dá a sensação de alguém
+  conduzindo o espectador - traduzir isso pra terceira pessoa impessoal
+  ("é possível observar que...") mata justamente o efeito. Se o inglês
+  tinha "now look at what happens", o português é "agora repare no que
+  acontece", não "observa-se que ocorre".
+- NUNCA transforme nada em primeira pessoa do SINGULAR na tradução: não
+  invente "eu descobri", "eu analisei", "na minha opinião" onde o
+  original não tinha - a narração é sintética e o autor não apurou nada,
+  então isso viraria uma alegação pessoal falsa.
+
+Responda com o ROTEIRO COMPLETO traduzido, do início ao fim, no mesmo
+formato "NARRAÇÃO:"/"VISUAL:" linha por linha, sem comentário sobre a
+tarefa, sem repetir nomes de passo, sem escrever o roteiro duas vezes.
+"""
+
 
 # =========================================================================
 # FUNÇÃO BASE DE CHAMADA AO LLM
@@ -636,23 +1184,61 @@ _PALAVRAS_MODELO_IGNORAR = (
 )
 
 
+def _contexto_do_modelo(m):
+    """
+    Lê o context_window que a Groq devolve como campo EXTRA (o tipo Model
+    do SDK da OpenAI não tem esse campo, então ele fica em model_extra).
+    Devolve None quando não vem - nesse caso o modelo NÃO é descartado,
+    só entra sem garantia.
+    """
+    valor = getattr(m, "context_window", None)
+    if valor is None:
+        extras = getattr(m, "model_extra", None) or {}
+        valor = extras.get("context_window")
+    try:
+        return int(valor) if valor is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+# Contexto mínimo pra este pipeline. O prompt do crítico embute o roteiro
+# inteiro e passa de 8 mil tokens com folga - um modelo de 4.096 (como o
+# allam-2-7b, que aparece na lista ao vivo) recusa o pedido na hora com
+# "Please reduce the length of the messages". Descartar antes de tentar
+# evita gastar uma chamada e um erro confuso.
+CONTEXTO_MINIMO_NECESSARIO = 16000
+
+
 def _obter_modelos_groq_ao_vivo():
     """
     Consulta a API do Groq pra saber quais modelos a SUA chave específica
     pode usar agora - em vez de depender de uma lista fixa que erra sempre
     que a conta não tem acesso a um modelo específico, ou o catálogo muda.
+
+    Também descarta modelo com janela de contexto pequena demais pro
+    tamanho de prompt deste pipeline (ver CONTEXTO_MINIMO_NECESSARIO).
     """
     global _modelos_groq_ao_vivo
     if _modelos_groq_ao_vivo is not None:
         return _modelos_groq_ao_vivo
     try:
         resposta = client_groq.models.list()
-        ids = [
-            m.id
-            for m in resposta.data
-            if not any(p in m.id.lower() for p in _PALAVRAS_MODELO_IGNORAR)
-        ]
+        ids = []
+        descartados_por_contexto = []
+        for m in resposta.data:
+            if any(p in m.id.lower() for p in _PALAVRAS_MODELO_IGNORAR):
+                continue
+            contexto = _contexto_do_modelo(m)
+            if contexto is not None and contexto < CONTEXTO_MINIMO_NECESSARIO:
+                descartados_por_contexto.append(f"{m.id} ({contexto})")
+                continue
+            ids.append(m.id)
         print(f"    (modelos disponíveis nessa chave Groq: {', '.join(ids)})")
+        if descartados_por_contexto:
+            print(
+                "    (descartados por contexto pequeno demais: "
+                f"{', '.join(descartados_por_contexto)})"
+            )
         _modelos_groq_ao_vivo = ids
     except Exception as e:
         print(f"    Aviso: não consegui consultar a lista ao vivo do Groq ({e}).")
@@ -676,6 +1262,36 @@ def _kwargs_extra_para_modelo(modelo):
     return {}
 
 
+# Assinaturas do erro "o PROMPT (entrada) é grande demais". É diferente de
+# cota estourada e de resposta cortada por max_tokens (saída) - e a
+# confusão entre os três já produziu uma mensagem de erro que culpava a
+# cota quando o problema real era o prompt inflando entre as tentativas.
+_MARCAS_ERRO_CONTEXTO = (
+    "context_length_exceeded",
+    "reduce the length of the messages",
+    "maximum context length",
+)
+
+
+def _erro_e_de_contexto(erro):
+    texto = str(erro).lower()
+    return any(marca.lower() in texto for marca in _MARCAS_ERRO_CONTEXTO)
+
+
+_MENSAGEM_ERRO_CONTEXTO = (
+    "Nenhum modelo disponível nesta chave Groq aceitou o tamanho deste "
+    "prompt (erro de contexto, não de cota - esperar não resolve).\n"
+    "Isso quase sempre significa que os modelos grandes (gpt-oss-120b/20b, "
+    "131 mil tokens de contexto) estão indisponíveis ou com cota estourada "
+    "agora, e sobraram só modelos de contexto pequeno (ex: allam-2-7b, com "
+    "4 mil) - que não cabem o roteiro inteiro que o crítico precisa ler.\n"
+    "O que fazer: espere a cota dos modelos grandes voltar (é o caso mais "
+    "comum), confira console.groq.com/dashboard/limits, ou rode com "
+    "USAR_NUVEM = False pra usar o Ollama local.\n"
+    "Erro original da API:\n{erro}"
+)
+
+
 def _chamar_groq_com_fallback(messages, temperature, max_tokens):
     global _modelo_groq_confirmado
 
@@ -687,6 +1303,7 @@ def _chamar_groq_com_fallback(messages, temperature, max_tokens):
         ordem = list(MODELOS_GROQ_FALLBACK)
 
     ultimo_erro = None
+    houve_erro_de_contexto = False
     for modelo in ordem:
         try:
             resposta = client_groq.chat.completions.create(
@@ -701,6 +1318,23 @@ def _chamar_groq_com_fallback(messages, temperature, max_tokens):
                 _modelo_groq_confirmado = modelo
             return resposta
         except Exception as e:
+            if _erro_e_de_contexto(e):
+                # CORREÇÃO: janela de contexto é POR MODELO (gpt-oss tem
+                # 131 mil tokens, allam-2-7b tem 4 mil), então este erro
+                # NÃO significa que o prompt é grande pra todos - só pra
+                # este. Abortar aqui (como eu fazia antes) impedia de
+                # tentar um modelo maior que daria conta. Então: pula.
+                houve_erro_de_contexto = True
+                print(
+                    f"    Aviso: modelo Groq '{modelo}' recusou por janela de "
+                    "contexto pequena pro tamanho deste prompt - tentando um "
+                    "modelo com contexto maior..."
+                )
+                if _modelo_groq_confirmado == modelo:
+                    # não fixa um modelo pequeno como "o confirmado"
+                    _modelo_groq_confirmado = None
+                ultimo_erro = e
+                continue
             print(
                 f"    Aviso: modelo Groq '{modelo}' falhou "
                 f"({type(e).__name__}) - tentando o próximo da lista..."
@@ -729,12 +1363,29 @@ def _chamar_groq_com_fallback(messages, temperature, max_tokens):
             _modelo_groq_confirmado = modelo
             return resposta
         except Exception as e:
+            if _erro_e_de_contexto(e):
+                houve_erro_de_contexto = True
+                print(
+                    f"    Aviso: modelo Groq '{modelo}' (da lista ao vivo) "
+                    "recusou por janela de contexto pequena - tentando o "
+                    "próximo..."
+                )
+                ultimo_erro = e
+                continue
             print(
                 f"    Aviso: modelo Groq '{modelo}' (da lista ao vivo) falhou "
                 f"({type(e).__name__}) - tentando o próximo..."
             )
             ultimo_erro = e
             continue
+
+    # Só agora, com TODOS os modelos esgotados, dá pra dizer o que
+    # aconteceu de verdade: se algum recusou por contexto e nenhum
+    # funcionou, o prompt é grande pros modelos que esta chave tem.
+    if houve_erro_de_contexto:
+        raise RuntimeError(
+            _MENSAGEM_ERRO_CONTEXTO.format(erro=ultimo_erro)
+        ) from ultimo_erro
 
     raise RuntimeError(
         "Nenhum modelo do Groq funcionou, nem da lista fixa nem da consulta "
@@ -746,6 +1397,71 @@ def _chamar_groq_com_fallback(messages, temperature, max_tokens):
         "Confira console.groq.com/dashboard/limits pra ver a cota de cada "
         "modelo específico."
     ) from ultimo_erro
+
+
+class _RespostaOllamaNativa:
+    """
+    Adaptador: deixa a resposta do endpoint NATIVO do Ollama com a mesma
+    forma que o resto do código espera (resposta.choices[0].message.content
+    e .finish_reason), pra não precisar mudar chamar_llm() nem nada abaixo.
+    """
+
+    class _Escolha:
+        class _Mensagem:
+            def __init__(self, content):
+                self.content = content
+
+        def __init__(self, content, finish_reason):
+            self.message = self._Mensagem(content)
+            self.finish_reason = finish_reason
+
+    def __init__(self, content, finish_reason):
+        self.choices = [self._Escolha(content, finish_reason)]
+
+
+def _chamar_ollama_nativo(mensagens, temperature, max_tokens):
+    """
+    Usa o endpoint NATIVO do Ollama (/api/chat) em vez do compatível com
+    OpenAI (/v1/chat/completions).
+
+    MOTIVO (confirmado em várias fontes e em testes diretos de terceiros):
+    o endpoint /v1 do Ollama IGNORA o num_ctx e roda tudo no padrão do
+    daemon (2048-4096 tokens), TRUNCANDO o prompt em silêncio - sem erro,
+    sem aviso, sem nada no retorno. Só aparece um "truncating input
+    prompt" no log do servidor Ollama, que ninguém está olhando. Os
+    prompts deste pipeline passam de 2.600 tokens (o do crítico, com o
+    roteiro inteiro dentro, passa de 8.000), então no /v1 o crítico
+    avaliaria um roteiro cortado no meio achando que leu tudo. O /api/chat
+    respeita options.num_ctx de verdade.
+    """
+    resp = requests.post(
+        f"{OLLAMA_BASE_URL}/api/chat",
+        json={
+            "model": MODEL,
+            "messages": mensagens,
+            "stream": False,
+            "options": {
+                "temperature": temperature,
+                "num_predict": max_tokens,
+                "num_ctx": OLLAMA_NUM_CTX,
+            },
+        },
+        timeout=OLLAMA_TIMEOUT_S,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Ollama retornou erro {resp.status_code} - {resp.text[:300]}\n"
+            "Confira se o Ollama está rodando (abra http://localhost:11434 "
+            "no navegador; tem que aparecer 'Ollama is running') e se o "
+            f"modelo '{MODEL}' já foi baixado (ollama pull {MODEL})."
+        )
+    dados = resp.json()
+    conteudo = (dados.get("message") or {}).get("content", "") or ""
+    # No nativo o campo é done_reason ("stop" | "length" | ...) - traduz
+    # pro nome que o resto do código já usa
+    done_reason = dados.get("done_reason")
+    finish_reason = "length" if done_reason == "length" else "stop"
+    return _RespostaOllamaNativa(conteudo, finish_reason)
 
 
 def chamar_llm(prompt, temperature=0.7, max_tokens=8192, avisar_corte=True):
@@ -770,12 +1486,7 @@ def chamar_llm(prompt, temperature=0.7, max_tokens=8192, avisar_corte=True):
             )
         resposta = _chamar_groq_com_fallback(mensagens, temperature, max_tokens)
     else:
-        resposta = client_local.chat.completions.create(
-            model=MODEL,
-            messages=mensagens,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        resposta = _chamar_ollama_nativo(mensagens, temperature, max_tokens)
 
     escolha = resposta.choices[0]
     if avisar_corte and getattr(escolha, "finish_reason", None) == "length":
@@ -986,7 +1697,9 @@ def gerar_temas_por_referencia(titulos_referencia, quantidade=6):
 # =========================================================================
 
 def escrever_roteiro(tema, roteiro_anterior=None, mudancas_obrigatorias=None, historico_mudancas=None):
-    prompt = ROTEIRO_PROMPT.format(tema=tema)
+    template = ROTEIRO_PROMPT_EN if GERAR_EM_INGLES else ROTEIRO_PROMPT
+    prompt = template.format(tema=tema)
+    prompt += gerar_reforco_por_aprendizado()
     if roteiro_anterior and mudancas_obrigatorias:
         prompt += (
             "\n\nJá existe uma versão anterior deste roteiro, que foi REPROVADA "
@@ -994,7 +1707,8 @@ def escrever_roteiro(tema, roteiro_anterior=None, mudancas_obrigatorias=None, hi
             "outra do zero. Mantenha tudo que já estava bom e mude APENAS o que "
             "está listado como obrigatório abaixo - se um trecho não foi citado "
             "no apontamento, deixe ele como está.\n\n"
-            f"VERSÃO ANTERIOR (revise a partir dela):\n{roteiro_anterior}\n\n"
+            f"VERSÃO ANTERIOR (revise a partir dela):\n"
+            f"{_truncar(roteiro_anterior, 14000, 'roteiro anterior')}\n\n"
             f"MUDANÇAS OBRIGATÓRIAS (corrija só isso, nada além):\n"
             f"{mudancas_obrigatorias}\n\n"
             "DICA DE EXECUÇÃO - se a mudança pedir mini-gancho num bloco que "
@@ -1016,8 +1730,11 @@ def escrever_roteiro(tema, roteiro_anterior=None, mudancas_obrigatorias=None, hi
                 "escalando pra reescrita completa do(s) bloco(s) problemático(s) "
                 "em vez de ajuste pontual."
             )
+            # Cada item é truncado individualmente: o histórico cresce a
+            # cada tentativa, então é aqui que a soma estourava o contexto.
             historico_formatado = "\n---\n".join(
-                f"Tentativa {i}: {m}" for i, m in enumerate(historico_mudancas, 1)
+                f"Tentativa {i}: {_truncar(m, 1200, 'pedido')}"
+                for i, m in enumerate(historico_mudancas, 1)
             )
             prompt += (
                 "\n\nATENÇÃO - ESCALAÇÃO (leia antes de revisar): este "
@@ -1043,12 +1760,18 @@ def escrever_roteiro(tema, roteiro_anterior=None, mudancas_obrigatorias=None, hi
 # =========================================================================
 
 def avaliar_roteiro(roteiro, mudancas_pedidas_antes=None):
-    prompt = AVALIACAO_PROMPT.format(roteiro=roteiro)
+    template = AVALIACAO_PROMPT_EN if GERAR_EM_INGLES else AVALIACAO_PROMPT
+    # O roteiro vai inteiro pro prompt, e foi aqui que a API recusou o
+    # pedido com 'context_length_exceeded' quando um roteiro veio
+    # gigante/duplicado. Um roteiro legítimo desse canal tem ~1300-1600
+    # palavras (uns 12k caracteres com as linhas VISUAL), então 20k dá
+    # folga confortável e ainda barra o caso patológico.
+    prompt = template.format(roteiro=_truncar(roteiro, 20000, "roteiro"))
     if mudancas_pedidas_antes and not mudancas_sao_vazias(mudancas_pedidas_antes):
         prompt += (
             "\n\nCONTEXTO: na rodada de avaliação ANTERIOR, você (ou outra "
             "avaliação deste mesmo roteiro) pediu estas mudanças:\n"
-            f"{mudancas_pedidas_antes}\n\n"
+            f"{_truncar(mudancas_pedidas_antes, 3000, 'pedido anterior')}\n\n"
             "O roteirista revisou o texto tentando atender exatamente essa "
             "lista. REGRA IMPORTANTE: não peça pra desfazer algo que está "
             "nessa lista acima - se você pediu pra ADICIONAR um elemento, "
@@ -1060,6 +1783,27 @@ def avaliar_roteiro(roteiro, mudancas_pedidas_antes=None):
             "novo ou genuinamente não resolvido."
         )
     return chamar_llm(prompt, temperature=0.2, max_tokens=2500)
+
+
+def _truncar(texto, limite_caracteres, rotulo="trecho"):
+    """
+    Corta um texto que vai ser REINJETADO num prompt. Existe por causa de
+    um estouro real de contexto: o prompt do roteirista recebe de volta o
+    roteiro anterior + as mudanças pedidas + o histórico de TODAS as
+    rodadas, e o do crítico recebe o roteiro inteiro. Sem teto, cada
+    tentativa cresce sobre a anterior até a API recusar o pedido todo com
+    'context_length_exceeded' - foi exatamente o que aconteceu na 3ª
+    tentativa de um refazer. Cortar um pedaço do contexto é ruim; abortar
+    a execução inteira é pior.
+    """
+    if not texto or len(texto) <= limite_caracteres:
+        return texto
+    cortado = texto[:limite_caracteres]
+    return (
+        f"{cortado}\n\n[...{rotulo} cortado aqui - tinha {len(texto)} "
+        f"caracteres, ficou nos primeiros {limite_caracteres} pra não "
+        "estourar o limite de contexto do modelo]"
+    )
 
 
 def mudancas_sao_vazias(mudancas_texto):
@@ -1075,24 +1819,429 @@ def mudancas_sao_vazias(mudancas_texto):
 
 def extrair_mudancas_obrigatorias(avaliacao_texto):
     """Pega só o campo 'MUDANÇAS OBRIGATÓRIAS' do template do crítico -
-    em vez de mandar a avaliação inteira de volta pro roteirista."""
+    em vez de mandar a avaliação inteira de volta pro roteirista.
+
+    O fallback (quando o crítico não segue o template) é TRUNCADO de
+    propósito: antes ele devolvia a avaliação inteira, que ia pro prompt
+    do roteirista E pro histórico acumulado de todas as rodadas - três ou
+    quatro tentativas assim estouravam o contexto do modelo e derrubavam
+    a execução com 'context_length_exceeded'.
+    """
     match = re.search(
-        r"MUDANÇAS OBRIGATÓRIAS:\s*(.+?)(?:\n\s*VEREDITO:|\Z)",
+        _padrao_rotulo("MUDANÇAS OBRIGATÓRIAS")
+        + r"(.+?)(?:\n[*_#>\s]*VEREDITO[*_#\s]*:|\Z)",
         avaliacao_texto,
         re.DOTALL,
     )
     if match:
-        return match.group(1).strip()
-    return avaliacao_texto  # fallback: manda tudo se não achar o campo
+        return _truncar(match.group(1).strip(), 3000, "lista de mudanças")
+    # Fallback: o crítico não seguiu o template. Manda a avaliação, mas
+    # CORTADA - devolver o texto inteiro aqui era o começo da bola de neve
+    # que estourava o contexto depois de 3-4 tentativas.
+    return _truncar(avaliacao_texto, 3000, "avaliação (template não seguido)")
 
 
 def extrair_veredito(avaliacao_texto):
     """Lê a linha 'VEREDITO:' do template fixo de avaliação."""
-    match = re.search(r"VEREDITO:\s*(APROVADO|REPROVADO)", avaliacao_texto, re.IGNORECASE)
+    match = re.search(
+        _padrao_rotulo("VEREDITO") + r"(APROVADO|REPROVADO)",
+        avaliacao_texto,
+        re.IGNORECASE,
+    )
     if match:
         return match.group(1).lower()
     # modelo pequeno pode não seguir o template à risca - fallback simples
     return "aprovado" if "aprovado" in avaliacao_texto.lower()[-200:] else "reprovado"
+
+
+def _campo_indica_problema(valor_bruto):
+    """
+    Cada campo do template tem uma forma diferente de dizer 'sem problema'
+    ("Nenhum encontrado", "Todos os blocos têm mini-gancho", "Nenhuma
+    encontrada") - normaliza tudo isso numa checagem só.
+    """
+    valor = valor_bruto.strip().strip("*_# ").lower()
+    if not valor:
+        return False
+    frases_vazias = (
+        "nenhum", "nenhuma", "todos os blocos têm mini-gancho",
+        "todos os blocos tem mini-gancho", "none", "n/a", "-",
+    )
+    return not any(valor.startswith(f) for f in frases_vazias)
+
+
+def registrar_aprendizado(avaliacao_texto):
+    """
+    Depois de CADA avaliação (aprovada ou não), extrai quais campos
+    tiveram problema real e acumula num arquivo ao lado do script - esse
+    histórico sobrevive entre execuções diferentes, então o pipeline vai
+    "lembrando" quais erros o crítico mais aponta ao longo de vários
+    vídeos, não só dentro de uma execução.
+    """
+    if CAMINHO_ESTATISTICAS_APRENDIZADO.exists():
+        try:
+            with open(CAMINHO_ESTATISTICAS_APRENDIZADO, "r", encoding="utf-8") as f:
+                stats = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            stats = {}
+    else:
+        stats = {}
+
+    stats.setdefault("total_avaliacoes", 0)
+    stats.setdefault("problemas", {c: 0 for c in _CAMPOS_PROBLEMA_APRENDIZADO})
+    stats["total_avaliacoes"] += 1
+
+    for campo in _CAMPOS_PROBLEMA_APRENDIZADO:
+        match = re.search(_padrao_rotulo(campo) + r"(.+)", avaliacao_texto)
+        if match and _campo_indica_problema(match.group(1)):
+            stats["problemas"][campo] = stats["problemas"].get(campo, 0) + 1
+
+    with open(CAMINHO_ESTATISTICAS_APRENDIZADO, "w", encoding="utf-8") as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+
+    return stats
+
+
+def gerar_reforco_por_aprendizado(limiar=0.4, minimo_avaliacoes=3):
+    """
+    Olha o histórico acumulado e, se algum problema aparece em uma fatia
+    alta das avaliações passadas (padrão: 40%, com pelo menos 3 vídeos
+    avaliados pra não reagir a coincidência de amostra pequena), devolve
+    um texto extra pra reforçar exatamente esse ponto no próximo roteiro -
+    ANTES de virar reclamação repetida de novo.
+    """
+    if not CAMINHO_ESTATISTICAS_APRENDIZADO.exists():
+        return ""
+    try:
+        with open(CAMINHO_ESTATISTICAS_APRENDIZADO, "r", encoding="utf-8") as f:
+            stats = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return ""
+
+    total = stats.get("total_avaliacoes", 0)
+    if total < minimo_avaliacoes:
+        return ""
+
+    # "NÚMEROS SEM VERIFICAR" sai do reforço: quem resolve isso agora é
+    # marcar_verificar_automatico(), no código, com 100% de acerto.
+    # Continuar gritando no prompt sobre o problema já resolvido só rouba
+    # atenção do modelo dos pontos que ainda dependem dele.
+    campos_ja_resolvidos_no_codigo = ("NÚMEROS SEM VERIFICAR",)
+
+    candidatos = []
+    for campo, contagem in stats.get("problemas", {}).items():
+        if campo in campos_ja_resolvidos_no_codigo:
+            continue
+        taxa = contagem / total
+        if taxa >= limiar:
+            candidatos.append((taxa, campo, contagem))
+
+    # No máximo 3, dos mais frequentes pros menos: lista longa de "preste
+    # atenção" vira ruído e o modelo pequeno acaba não priorizando nada.
+    candidatos.sort(reverse=True)
+    reforcos = [
+        f"- '{campo}' apareceu em {contagem} de {total} vídeos "
+        f"anteriores ({taxa * 100:.0f}%) - preste atenção redobrada "
+        "nisso especificamente antes de entregar."
+        for taxa, campo, contagem in candidatos[:3]
+    ]
+
+    if not reforcos:
+        return ""
+
+    return (
+        "\n\nAVISO BASEADO NO HISTÓRICO (padrão de erro acumulado dos "
+        f"últimos {total} vídeos deste canal, não só desta execução):\n"
+        + "\n".join(reforcos)
+    )
+
+
+# =========================================================================
+# CORREÇÃO MECÂNICA - o que o código consegue resolver sozinho, o prompt
+# não precisa pedir
+# =========================================================================
+# Por que esta seção existe: o histórico de aprendizado mostrou
+# "NÚMEROS SEM VERIFICAR" em 15 de 17 avaliações (88%). Ou seja: a regra
+# mais repetida do prompt do roteirista era justamente a que o modelo
+# menos conseguia cumprir - e cada falha dessas custava uma tentativa
+# INTEIRA do loop (roteiro + crítica), sem nunca convergir: o crítico
+# listava os mesmos números na tentativa 2 e na 3, palavra por palavra.
+#
+# Só que "colocar [VERIFICAR] do lado de todo número específico" não é
+# uma tarefa de julgamento, é uma tarefa de texto. Regex faz isso com
+# 100% de acerto e custo zero. O modelo passa a ser cobrado só pelo que
+# de fato depende dele (estrutura, gancho, ritmo, não inventar enredo).
+#
+# Marcar de MAIS aqui é inofensivo de propósito: o marcador é removido
+# de qualquer forma em extrair_narracao_limpa() antes do áudio, então
+# ele nunca chega no ElevenLabs - o efeito prático é só a sua revisão
+# manual ficar com mais itens conferidos, que é exatamente o aviso
+# permanente deste projeto ("revise todo [VERIFICAR] em fonte primária").
+
+# Ordem das alternativas importa: a primeira que casa vence, então as
+# formas longas (R$ 1,2 bilhão) vêm antes das curtas (1,2).
+# ATENÇÃO à ordem das unidades: "milhões" TEM que vir antes de "mil",
+# senão o regex casa só o "mil" de "milhões" e o marcador entra no meio
+# da palavra ("US$ 400 mil [VERIFICAR]hões"). Regex alterna da esquerda
+# pra direita e aceita o primeiro que casar, não o mais longo.
+_UNIDADES_DE_ESCALA = (
+    r"(?:milh(?:ão|ões|ao|oes)|bilh(?:ão|ões|ao|oes)|"
+    r"trilh(?:ão|ões|ao|oes)|million|billion|trillion|thousand|mil)"
+)
+
+_PADRAO_NUMERO_ESPECIFICO = re.compile(
+    r"(?:R\$|US\$|U\$|USD|BRL|\$|€)\s?\d[\d.,]*"
+    r"(?:\s?" + _UNIDADES_DE_ESCALA + r")?\b"
+    r"|\d[\d.,]*\s?(?:%|por\s?cento|percent)"
+    r"|\d[\d.,]*\s?" + _UNIDADES_DE_ESCALA + r"\b"
+    r"|\b(?:1[5-9]\d{2}|20\d{2})\b"
+    r"|\b\d{1,3}(?:[.,]\d{3})+\b"
+    r"|\b\d{3,}\b",
+    re.IGNORECASE,
+)
+
+_INICIO_LINHA_NARRACAO = re.compile(r"^[\s*#>\-]*NARRA[ÇC][ÃA]O\s*:", re.IGNORECASE)
+
+# Distância (em caracteres) dentro da qual um [VERIFICAR] que o próprio
+# roteirista escreveu já conta como "do lado" do número - evita marcar
+# duas vezes a mesma coisa.
+_RAIO_DO_MARCADOR = 30
+
+# Dois números que formam UMA expressão só ("entre 2015 e 2019", "de 24%
+# para 30%", "R$ 4 bilhões a R$ 5 bilhões") dividem um marcador - dois
+# seguidos ali só poluiriam a linha. O teste é o que existe ENTRE eles:
+# se for só conectivo/pontuação, é a mesma expressão; se tiver qualquer
+# outra palavra ("em 2015, faturou R$ 2,5 bilhões"), são alegações
+# diferentes e cada uma leva o seu marcador.
+_LIGACAO_ENTRE_NUMEROS = re.compile(
+    r"[\s,]*(?:e|a|ou|até|ate|para|and|to|or|-|–|—|/)?[\s,]*",
+    re.IGNORECASE,
+)
+
+
+def marcar_verificar_automatico(roteiro):
+    """
+    Percorre só as linhas NARRAÇÃO e coloca [VERIFICAR] ao lado de todo
+    número específico (percentual, R$/US$, escala, ano, quantidade grande)
+    que ainda não tenha um marcador perto. Devolve (roteiro, quantidade
+    marcada).
+
+    Não toca em linha VISUAL - lá o número faz parte da descrição da
+    imagem, não é alegação factual narrada. Se NARRAÇÃO e VISUAL vierem
+    grudados na mesma linha (acontece quando o modelo erra o formato),
+    corta no "VISUAL:" e só marca a parte narrada.
+    """
+    if not roteiro:
+        return roteiro, 0
+
+    marcados = 0
+    linhas_saida = []
+    for linha in roteiro.splitlines():
+        if not _INICIO_LINHA_NARRACAO.match(linha):
+            linhas_saida.append(linha)
+            continue
+
+        corte = linha.upper().find("VISUAL:")
+        parte_narrada = linha if corte == -1 else linha[:corte]
+        resto_da_linha = "" if corte == -1 else linha[corte:]
+
+        pedacos = []
+        ultimo_fim = 0
+        ultima_marca = None
+        for achado in _PADRAO_NUMERO_ESPECIFICO.finditer(parte_narrada):
+            vizinhanca = parte_narrada[
+                max(0, achado.start() - _RAIO_DO_MARCADOR):
+                achado.end() + _RAIO_DO_MARCADOR
+            ]
+            if "[VERIFICAR]" in vizinhanca:
+                continue
+            if ultima_marca is not None and _LIGACAO_ENTRE_NUMEROS.fullmatch(
+                parte_narrada[ultima_marca:achado.start()]
+            ):
+                continue
+            pedacos.append(parte_narrada[ultimo_fim:achado.end()])
+            pedacos.append(" [VERIFICAR]")
+            ultimo_fim = achado.end()
+            ultima_marca = achado.end()
+            marcados += 1
+        pedacos.append(parte_narrada[ultimo_fim:])
+        linhas_saida.append("".join(pedacos) + resto_da_linha)
+
+    return "\n".join(linhas_saida), marcados
+
+
+def _padrao_rotulo(nome):
+    """
+    Monta o regex de um rótulo do template do crítico tolerando o que
+    modelo pequeno faz com formatação: markdown em volta
+    ("**MUDANÇAS OBRIGATÓRIAS:**"), acento comido ("MUDANCAS
+    OBRIGATORIAS:") e espaço a mais. Sem isso, uma estrela perdida fazia
+    a extração cair no fallback e mandar a AVALIAÇÃO INTEIRA de volta pro
+    roteirista como se fosse a lista de mudanças - que é como o loop
+    começava a girar em falso.
+    """
+    partes = []
+    for caractere in nome:
+        if caractere == " ":
+            partes.append(r"\s+")
+            continue
+        base = unicodedata.normalize("NFD", caractere)[0]
+        if base != caractere and base.isalpha():
+            partes.append(f"[{caractere}{base}]")
+        else:
+            partes.append(re.escape(caractere))
+    return r"[*_#>\s]*" + "".join(partes) + r"[*_#\s]*:[ \t]*[*_#]*"
+
+
+# Marcas de SUGESTÃO: se o item começa assim, o próprio crítico está
+# dizendo que aquilo é opinião, não requisito. Isso não pode reprovar um
+# roteiro - "Considerar a possibilidade de adicionar mini-ganchos" já
+# travou tentativa de roteiro bom aqui.
+_MARCAS_DE_SUGESTAO = (
+    "considerar", "considere", "considerando", "poderia", "poderiam",
+    "talvez", "sugiro", "sugere-se", "sugestao", "sugestão", "recomenda-se",
+    "recomendo", "seria bom", "seria interessante", "seria ideal",
+    "se possivel", "se possível", "opcional", "idealmente", "avaliar se",
+    "consider", "could ", "might ", "optionally", "optional",
+    "suggest", "it would be", "ideally", "nice to have", "perhaps",
+)
+
+# Pedidos que o roteirista NÃO tem como executar: ele não pesquisa, não
+# abre fonte, não confirma nada. "Verificar a veracidade dos eventos"
+# reprovava o roteiro pra sempre porque nenhuma revisão conseguia
+# satisfazer o pedido. O que o roteirista PODE fazer é marcar - então o
+# item é reescrito pra isso, em vez de virar um bloqueio eterno.
+_PEDIDOS_DE_PESQUISA = (
+    "veracidade", "verificar a autenticidade", "confirmar a fonte",
+    "confirmar as fontes", "consultar fontes", "buscar fontes",
+    "checar as fontes", "pesquisar", "pesquise", "fact-check", "fact check",
+    "verify the truth", "verify the accuracy", "verify the veracity",
+    "confirm the accuracy", "research ", "look up",
+)
+
+_ACAO_MARCAR_EVENTOS = (
+    "Adicione [VERIFICAR] ao lado de cada EVENTO narrativo que não seja "
+    "de conhecimento público amplo (processo, investigação, relatório, "
+    "vídeo viral, reunião de diretoria, decisão interna, mudança de "
+    "política). Você NÃO precisa pesquisar nem confirmar nada - basta "
+    "marcar o trecho na própria linha NARRAÇÃO."
+)
+
+# Palavras que sobram numa lista de números e não contam como instrução.
+_PALAVRAS_SEM_INSTRUCAO = {
+    "de", "do", "da", "dos", "das", "e", "em", "no", "na", "nos", "nas",
+    "por", "cento", "reais", "real", "dolares", "dólares", "mil",
+    "milhao", "milhão", "milhoes", "milhões", "bilhao", "bilhão",
+    "bilhoes", "bilhões", "trilhao", "trilhão", "trilhoes", "trilhões",
+    "ano", "anos", "pessoas", "usuarios", "usuários", "clientes",
+    "compradores", "vendedores", "funcionarios", "funcionários",
+    "lojas", "unidades", "r", "us", "usd", "brl", "the", "of", "and",
+    "in", "to", "million", "billion", "thousand", "trillion", "users",
+    "people", "buyers", "sellers", "years", "year", "customers",
+    "employees", "stores",
+}
+
+
+def _item_e_lista_solta(item):
+    """
+    Detecta o item que não é uma mudança, é só uma lista de dados
+    copiada de outro campo - foi literalmente a reprovação das tentativas
+    2 e 3 do seu run: "[2.5 bilhões de reais], [1.2 bilhões de reais],
+    [24%], [2015], [2019]...". Isso chega no roteirista sem nenhum verbo,
+    ele não tem como saber o que fazer, devolve o mesmo roteiro, o
+    crítico reprova igual - e a tentativa foi jogada fora.
+    """
+    if not _PADRAO_NUMERO_ESPECIFICO.search(item):
+        return False
+    resto = _PADRAO_NUMERO_ESPECIFICO.sub(" ", item)
+    resto = re.sub(r"[\[\]\(\)\{\},;:.\-–—/%$€*]", " ", resto)
+    palavras = [
+        p for p in resto.split()
+        if p.isalpha() and p.lower() not in _PALAVRAS_SEM_INSTRUCAO
+    ]
+    return len(palavras) <= 2
+
+
+def _normalizar_para_comparar(texto):
+    """Minúsculas, sem acento e sem pontuação - pra comparar dois pedidos
+    do crítico e saber se são o mesmo pedido escrito de outro jeito."""
+    decomposto = unicodedata.normalize("NFD", texto.lower())
+    sem_acento = "".join(c for c in decomposto if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", " ", sem_acento).strip()
+
+
+def _dividir_em_itens(mudancas_texto):
+    """Quebra a lista do crítico em itens, aceitando bullet de traço,
+    asterisco, bolinha ou numeração."""
+    itens = []
+    for linha in mudancas_texto.splitlines():
+        limpa = re.sub(r"^\s*(?:[-*•–—]|\d+[.)])\s*", "", linha).strip()
+        if limpa:
+            itens.append(limpa)
+    return itens
+
+
+def filtrar_mudancas_acionaveis(mudancas_texto):
+    """
+    Transforma a lista do crítico em pedidos que o roteirista consegue de
+    fato executar, e devolve (texto_acionavel, itens_descartados).
+
+    Três tratamentos:
+      1. lista solta de números -> vira uma ORDEM ("adicione [VERIFICAR]
+         ao lado destes números"), em vez de chegar sem verbo nenhum;
+      2. pedido de pesquisa ("verifique a veracidade") -> vira a única
+         ação equivalente que o roteirista tem: marcar [VERIFICAR];
+      3. sugestão ("considere", "seria bom") -> sai da lista obrigatória.
+         Continua contando no aprendizado e continua aparecendo no
+         relatório, só não reprova mais o roteiro sozinha.
+
+    Se depois disso não sobrar nada, o roteiro não tinha nenhuma mudança
+    obrigatória de verdade - e o chamador trata como aprovado.
+    """
+    if not mudancas_texto or mudancas_sao_vazias(mudancas_texto):
+        return "", []
+
+    acionaveis = []
+    descartados = []
+    ja_vistos = set()
+    for item in _dividir_em_itens(mudancas_texto):
+        comparavel = _normalizar_para_comparar(item)
+        if not comparavel or comparavel in ("nenhuma", "nenhum"):
+            continue
+
+        if _item_e_lista_solta(item):
+            item = (
+                "Adicione [VERIFICAR] na própria linha NARRAÇÃO, ao lado de "
+                f"cada um destes dados: {item}"
+            )
+        elif any(p in comparavel for p in _PEDIDOS_DE_PESQUISA):
+            item = _ACAO_MARCAR_EVENTOS
+        elif any(comparavel.startswith(m) or f" {m}" in f" {comparavel}"
+                 for m in _MARCAS_DE_SUGESTAO):
+            descartados.append(item)
+            continue
+
+        chave = _normalizar_para_comparar(item)
+        if chave in ja_vistos:
+            continue
+        ja_vistos.add(chave)
+        acionaveis.append(item)
+
+    texto = "\n".join(f"- {i}" for i in acionaveis)
+    return _truncar(texto, 3000, "lista de mudanças"), descartados
+
+
+def assinatura_do_pedido(mudancas_texto):
+    """
+    Impressão digital de um pedido do crítico, insensível a ordem e a
+    reescrita superficial. Serve pra detectar o loop travado: quando a
+    reprovação da tentativa N é a MESMA da tentativa N-1, insistir mais
+    uma rodada só queima tempo (e cota) - tentativas 2 e 3 do seu run
+    vieram idênticas, caractere por caractere.
+    """
+    if not mudancas_texto:
+        return ""
+    return " ".join(sorted(set(_normalizar_para_comparar(mudancas_texto).split())))
 
 
 # =========================================================================
@@ -1362,20 +2511,30 @@ def baixar_broll(broll_dict, pasta_destino, por_termo=1):
 # =========================================================================
 
 def gerar_metadados(tema, roteiro):
-    prompt = METADADOS_PROMPT.format(tema=tema, roteiro=roteiro)
+    # Truncado pelo mesmo motivo do crítico: este prompt embute o roteiro
+    # inteiro, e um roteiro anormalmente grande estourava o contexto aqui
+    # também (pegado em teste: 59 mil caracteres de prompt).
+    prompt = METADADOS_PROMPT.format(
+        tema=tema, roteiro=_truncar(roteiro, 20000, "roteiro")
+    )
     return chamar_llm(prompt, temperature=0.8, max_tokens=2000)
 
 
 def extrair_descricao_foto(metadados_texto):
-    """Pega o campo 'FOTO DO CRIADOR' de dentro da resposta de metadados."""
+    """Pega o campo 'FOTO DO CRIADOR' de dentro da resposta de metadados.
+
+    O fallback é truncado: devolver o texto inteiro de metadados aqui
+    fazia o prompt do agente de imagem chegar a 213 mil caracteres num
+    teste - mesmo padrão de bug do fallback das mudanças obrigatórias.
+    """
     match = re.search(
         r"FOTO DO CRIADOR.*?:\s*(.+?)(?:\n- [A-ZÀ-Ú]|\Z)",
         metadados_texto,
         re.DOTALL,
     )
     if match:
-        return match.group(1).strip()
-    return metadados_texto  # fallback: manda o texto todo se não achar o campo
+        return _truncar(match.group(1).strip(), 2000, "descrição da foto")
+    return _truncar(metadados_texto, 2000, "metadados (campo não encontrado)")
 
 
 # =========================================================================
@@ -1409,44 +2568,102 @@ def expandir_roteiro(roteiro, tema, palavras_atuais, alvo_minimo=1270):
     real desconexo com nomes de pessoas e números 100% fabricados), sem
     nenhum [VERIFICAR]. "Desenvolver mais" nunca pode significar "inventar
     fato novo" ou "continuar a história depois do fim".
+
+    Tem versão em inglês (mesmas regras, mesmo idioma do roteiro que está
+    sendo expandido quando GERAR_EM_INGLES está ligado) - os rótulos
+    NARRAÇÃO:/VISUAL: continuam em português dentro do texto em inglês,
+    pelo mesmo motivo de sempre: são só marcação fixa pro regex.
     """
-    prompt = (
-        f"O roteiro abaixo tem cerca de {palavras_atuais} palavras de "
-        f"narração, abaixo do mínimo de {alvo_minimo} necessário para um "
-        "vídeo de 8-10 minutos. Sua tarefa é DESENVOLVER MAIS o roteiro -\n\n"
-        "REGRAS QUE NÃO PODEM SER QUEBRADAS (mais importantes que o "
-        "tamanho):\n"
-        "- PROIBIDO inventar qualquer fato, número, nome de pessoa, data,\n"
-        "  valor ou evento que não estava no roteiro original. 'Desenvolver'\n"
-        "  significa reescrever com mais palavras o que já foi dito -\n"
-        "  explicar melhor o raciocínio, dar mais contexto - NUNCA "
-        "  adicionar um fato novo que parece plausível. Se não tem certeza\n"
-        "  se um número é real, marque [VERIFICAR], nunca invente pra\n"
-        "  preencher espaço.\n"
-        "- PROIBIDO continuar a história depois do final que já existe. O\n"
-        "  roteiro original já tem uma conclusão - não adicione um "
-        "  'segundo ato' ou nova sequência de eventos depois dela. Expanda\n"
-        "  POR DENTRO dos blocos que já existem, nunca por fora/depois.\n"
-        "- PROIBIDO duplicar qualquer trecho do roteiro original. A "
-        "  resposta final tem que ter cada fato UMA vez só.\n\n"
-        "Nesta ordem de prioridade, dentro dessas regras:\n"
-        "1. Desenvolva mais o MIOLO (a parte com a decisão/conflito "
-        "central) - adicione mais detalhe do raciocínio de gestão e do "
-        "contexto de cada etapa QUE JÁ FOI CITADA, sem trazer fato novo.\n"
-        "2. Garanta que cada bloco (backstory, miolo, conclusão) tenha "
-        "pelo menos um mini-gancho (dado novo, revelação pequena, "
-        "pergunta) - insira uma frase nova onde faltar, mas só reformulando\n"
-        "informação que já está no roteiro.\n"
-        "3. Mantenha o mesmo formato: cada frase em uma linha NARRAÇÃO:, "
-        "seguida numa linha separada por VISUAL:.\n\n"
-        f"TEMA: {tema}\n\n"
-        f"ROTEIRO ATUAL:\n{roteiro}\n\n"
-        "Responda com o ROTEIRO COMPLETO revisado e expandido (não só a "
-        "parte nova, o texto inteiro do início ao fim, UMA ÚNICA VEZ), sem "
-        "comentário sobre a tarefa, sem repetir nomes de passo, sem "
-        "adicionar um '---' ou qualquer divisor no meio do texto."
-    )
+    if GERAR_EM_INGLES:
+        prompt = (
+            f"The script below has about {palavras_atuais} words of "
+            f"narration, below the minimum of {alvo_minimo} needed for an "
+            "8-10 minute video. Your task is to DEVELOP the script FURTHER -\n\n"
+            "RULES THAT CANNOT BE BROKEN (more important than length):\n"
+            "- FORBIDDEN to invent any fact, number, person's name, date,\n"
+            "  amount, or event that was not in the original script.\n"
+            "  'Developing' means rewriting with more words what was\n"
+            "  already said - explaining the reasoning better, giving more\n"
+            "  context - NEVER adding a new fact that merely sounds\n"
+            "  plausible. If unsure whether a number is real, mark\n"
+            "  [VERIFICAR], never invent one just to fill space.\n"
+            "- FORBIDDEN to continue the story past the ending that already\n"
+            "  exists. The original script already has a conclusion - do\n"
+            "  not add a 'second act' or new sequence of events after it.\n"
+            "  Expand INSIDE the blocks that already exist, never\n"
+            "  outside/after them.\n"
+            "- FORBIDDEN to duplicate any part of the original script. The\n"
+            "  final answer must contain each fact exactly ONCE.\n\n"
+            "In this order of priority, within these rules:\n"
+            "1. Develop the CORE block further (the decision/conflict part)\n"
+            "- add more detail on the management reasoning and the context\n"
+            "of each step ALREADY MENTIONED, without bringing in a new fact.\n"
+            "2. Make sure every block (backstory, core, conclusion) has at\n"
+            "least one mini-hook (new fact, small reveal, question) -\n"
+            "insert a new sentence wherever one is missing, but only by\n"
+            "rephrasing information that is already in the script.\n"
+            "3. Keep the same format: each sentence on a NARRAÇÃO: line,\n"
+            "followed on a separate line by VISUAL: (labels stay in\n"
+            "Portuguese exactly as shown, content stays in English).\n\n"
+            f"TOPIC: {tema}\n\n"
+            f"CURRENT SCRIPT:\n{_truncar(roteiro, 20000, 'roteiro')}\n\n"
+            "Answer with the FULL revised and expanded SCRIPT (not just "
+            "the new part, the entire text start to finish, EXACTLY ONCE), "
+            "with no commentary about the task, no repeated step names, no "
+            "adding a '---' or any divider in the middle of the text."
+        )
+    else:
+        prompt = (
+            f"O roteiro abaixo tem cerca de {palavras_atuais} palavras de "
+            f"narração, abaixo do mínimo de {alvo_minimo} necessário para um "
+            "vídeo de 8-10 minutos. Sua tarefa é DESENVOLVER MAIS o roteiro -\n\n"
+            "REGRAS QUE NÃO PODEM SER QUEBRADAS (mais importantes que o "
+            "tamanho):\n"
+            "- PROIBIDO inventar qualquer fato, número, nome de pessoa, data,\n"
+            "  valor ou evento que não estava no roteiro original. 'Desenvolver'\n"
+            "  significa reescrever com mais palavras o que já foi dito -\n"
+            "  explicar melhor o raciocínio, dar mais contexto - NUNCA "
+            "  adicionar um fato novo que parece plausível. Se não tem certeza\n"
+            "  se um número é real, marque [VERIFICAR], nunca invente pra\n"
+            "  preencher espaço.\n"
+            "- PROIBIDO continuar a história depois do final que já existe. O\n"
+            "  roteiro original já tem uma conclusão - não adicione um "
+            "  'segundo ato' ou nova sequência de eventos depois dela. Expanda\n"
+            "  POR DENTRO dos blocos que já existem, nunca por fora/depois.\n"
+            "- PROIBIDO duplicar qualquer trecho do roteiro original. A "
+            "  resposta final tem que ter cada fato UMA vez só.\n\n"
+            "Nesta ordem de prioridade, dentro dessas regras:\n"
+            "1. Desenvolva mais o MIOLO (a parte com a decisão/conflito "
+            "central) - adicione mais detalhe do raciocínio de gestão e do "
+            "contexto de cada etapa QUE JÁ FOI CITADA, sem trazer fato novo.\n"
+            "2. Garanta que cada bloco (backstory, miolo, conclusão) tenha "
+            "pelo menos um mini-gancho (dado novo, revelação pequena, "
+            "pergunta) - insira uma frase nova onde faltar, mas só reformulando\n"
+            "informação que já está no roteiro.\n"
+            "3. Mantenha o mesmo formato: cada frase em uma linha NARRAÇÃO:, "
+            "seguida numa linha separada por VISUAL:.\n\n"
+            f"TEMA: {tema}\n\n"
+            f"ROTEIRO ATUAL:\n{_truncar(roteiro, 20000, 'roteiro')}\n\n"
+            "Responda com o ROTEIRO COMPLETO revisado e expandido (não só a "
+            "parte nova, o texto inteiro do início ao fim, UMA ÚNICA VEZ), sem "
+            "comentário sobre a tarefa, sem repetir nomes de passo, sem "
+            "adicionar um '---' ou qualquer divisor no meio do texto."
+        )
     return chamar_llm(prompt, temperature=0.7, max_tokens=8192)
+
+
+def traduzir_roteiro_para_ptbr(roteiro_ingles):
+    """
+    Último passo do esquema "escrever em inglês": pega o roteiro já
+    APROVADO pelo crítico (ainda em inglês) e traduz pra português falado
+    natural, preservando rótulos, marcadores e fatos exatamente. Só roda
+    quando GERAR_EM_INGLES está ligado - com ele desligado, o roteiro já
+    sai em português direto do roteirista, sem precisar desse passo.
+    """
+    prompt = TRADUCAO_PROMPT.format(
+        roteiro_ingles=_truncar(roteiro_ingles, 20000, "roteiro em inglês")
+    )
+    return chamar_llm(prompt, temperature=0.3, max_tokens=8192)
 
 
 # =========================================================================
@@ -1454,11 +2671,98 @@ def expandir_roteiro(roteiro, tema, palavras_atuais, alvo_minimo=1270):
 # =========================================================================
 
 
+# Abaixo deste tamanho o roteiro não é "fraco", é incompleto - e mandar
+# um texto incompleto pro crítico desperdiça a tentativa inteira: ele
+# reprova por falta de bloco/mini-gancho, o roteirista tenta remendar um
+# esqueleto, e o ciclo se repete. Expandir ANTES de avaliar troca uma
+# reprovação garantida por uma chamada de expansão.
+MINIMO_PALAVRAS_PRA_AVALIAR = 1100
+
+
+def aplicar_expansao(roteiro, tema, alvo_minimo=MINIMO_PALAVRAS_PRA_AVALIAR):
+    """
+    Roda o passe de expansão com todas as travas de segurança e devolve o
+    roteiro escolhido (expandido ou o original, se a expansão veio ruim).
+
+    Extraído pra função porque agora roda em dois lugares: dentro do loop
+    (antes de avaliar, pra não gastar tentativa com roteiro incompleto) e
+    depois do loop (rede de segurança final).
+    """
+    palavras = contar_palavras_narracao(roteiro)
+    if palavras >= alvo_minimo:
+        return roteiro
+
+    print(f"  Roteiro tem só ~{palavras} palavras de narração - rodando passe de expansão...")
+    roteiro_expandido = expandir_roteiro(roteiro, tema, palavras)
+    nova_contagem = contar_palavras_narracao(roteiro_expandido)
+
+    # Trava de segurança: se "expandir" na prática quase dobrou o
+    # tamanho, ou apareceu um divisor solto ("---"), é sinal de que o
+    # modelo continuou a história em vez de desenvolver o que já
+    # existia (já aconteceu - virou uma segunda história inventada
+    # colada na primeira). Se ficou com MENOS palavras que antes, é
+    # sinal de que a resposta foi cortada no meio por limite de token
+    # (já aconteceu também - expansão "piorou" o roteiro). Em
+    # qualquer um desses casos, descarta a expansão e fica com o
+    # roteiro mais curto, mas honesto/completo, em vez do mais longo,
+    # arriscado ou truncado.
+    # Teto ABSOLUTO, não proporção - a expansão dispara com roteiro
+    # abaixo de 1100 palavras, e o alvo é 1270-1620, então crescer
+    # mais de 1.8x é NORMAL vindo de um começo bem curto (ex:
+    # 700->1300 é legítimo). Um teto absoluto bem acima do alvo máximo
+    # (1620) ainda pega duplicação de verdade sem rejeitar expansão
+    # legítima por coincidência de proporção.
+    cresceu_alem_do_razoavel = nova_contagem > 2200
+    ficou_menor = nova_contagem <= palavras
+    tem_divisor_solto = bool(re.search(r"^\s*-{3,}\s*$", roteiro_expandido, re.MULTILINE))
+    poucas_narracoes = roteiro_expandido.count("NARRAÇÃO:") < 3
+    if cresceu_alem_do_razoavel or ficou_menor or tem_divisor_solto or poucas_narracoes:
+        if cresceu_alem_do_razoavel:
+            motivo = f"passou de {nova_contagem} palavras (provável duplicação)"
+        elif ficou_menor:
+            motivo = (
+                f"ficou com MENOS palavras que antes ({nova_contagem} <= {palavras}, "
+                "provável corte por limite de token)"
+            )
+        elif tem_divisor_solto:
+            motivo = "tem divisor '---' solto"
+        else:
+            motivo = "voltou sem as linhas NARRAÇÃO:"
+        print(f"  Aviso: expansão descartada - {motivo}. Mantendo a versão de ~{palavras} palavras.")
+        return roteiro
+
+    print(f"  Depois da expansão: ~{nova_contagem} palavras.")
+    return roteiro_expandido
+
+
+def _qualidade_da_tentativa(veredito, mudancas, roteiro):
+    """
+    Nota pra comparar tentativas entre si (menor = melhor). Existe porque
+    o loop antigo, ao estourar as tentativas, ficava com a ÚLTIMA versão -
+    que não é necessariamente a melhor: uma revisão pode piorar o roteiro
+    (encurtar, quebrar formato) e mesmo assim ser a última. Agora o
+    pipeline entrega a melhor de todas.
+
+    Ordem de critério: aprovado ganha de reprovado; menos pendência ganha
+    de mais pendência; e, empatado, o roteiro mais desenvolvido ganha.
+    """
+    pendencias = len(_dividir_em_itens(mudancas)) if mudancas else 0
+    return (
+        0 if veredito == "aprovado" else 1,
+        pendencias,
+        -contar_palavras_narracao(roteiro),
+    )
+
+
 def gerar_video_completo(tema, max_tentativas=4):
     mudancas = None
     roteiro = None
     avaliacao = None
     historico = []  # guarda o motivo de reprovação de CADA tentativa, não só a última
+    melhor = None  # melhor tentativa vista até agora (ver _qualidade_da_tentativa)
+    pendencias_manuais = ""
+    assinatura_anterior = ""
+    repeticoes_do_mesmo_pedido = 0
 
     for tentativa in range(1, max_tentativas + 1):
         print(f"[Tentativa {tentativa}] Gerando roteiro para: {tema}")
@@ -1488,10 +2792,46 @@ def gerar_video_completo(tema, max_tentativas=4):
             if roteiro.count("NARRAÇÃO:") < 3:
                 print("    Aviso: segunda tentativa também veio inválida - avaliando mesmo assim.")
 
+        # PRIMEIRA CORREÇÃO MECÂNICA: marca os números antes de qualquer
+        # avaliação. Era o campeão de reprovação (88% das avaliações) e
+        # nunca foi um problema de julgamento - só de execução repetitiva.
+        roteiro, numeros_marcados = marcar_verificar_automatico(roteiro)
+        if numeros_marcados:
+            print(
+                f"    {numeros_marcados} número(s) específico(s) receberam "
+                "[VERIFICAR] automaticamente (confira cada um em fonte "
+                "primária antes de gravar)."
+            )
+
+        # SEGUNDA CORREÇÃO MECÂNICA: roteiro curto demais é expandido
+        # ANTES da crítica, não depois. Um esqueleto de 300 palavras seria
+        # reprovado nas 4 tentativas por motivos que só o tamanho causa.
+        roteiro = aplicar_expansao(roteiro, tema)
+        roteiro, numeros_pos_expansao = marcar_verificar_automatico(roteiro)
+        if numeros_pos_expansao:
+            print(f"    +{numeros_pos_expansao} número(s) marcados após a expansão.")
+
         print("  Avaliando roteiro...")
         avaliacao = avaliar_roteiro(roteiro, mudancas_pedidas_antes=mudancas)
         veredito = extrair_veredito(avaliacao)
-        mudancas = extrair_mudancas_obrigatorias(avaliacao)
+        mudancas_brutas = extrair_mudancas_obrigatorias(avaliacao)
+        registrar_aprendizado(avaliacao)
+
+        # Só bloqueia o roteiro o que o roteirista consegue executar. O
+        # resto (sugestão, pedido de pesquisa solto, lista de números sem
+        # instrução) é tratado ou descartado aqui - ver
+        # filtrar_mudancas_acionaveis.
+        mudancas, apenas_sugestoes = filtrar_mudancas_acionaveis(mudancas_brutas)
+        for sugestao in apenas_sugestoes:
+            print(f"    (sugestão, não bloqueia): {sugestao}")
+
+        if veredito == "reprovado" and mudancas_sao_vazias(mudancas):
+            print(
+                "    Aviso: crítico reprovou mas não sobrou nenhuma mudança "
+                "obrigatória executável (era sugestão ou pedido de pesquisa) "
+                "- tratando como APROVADO."
+            )
+            veredito = "aprovado"
 
         if veredito == "aprovado" and not mudancas_sao_vazias(mudancas):
             print(
@@ -1503,55 +2843,107 @@ def gerar_video_completo(tema, max_tentativas=4):
         print(f"  Veredito: {veredito.upper()}")
 
         historico.append(
-            {"tentativa": tentativa, "veredito": veredito, "mudancas_pedidas": mudancas}
+            {
+                "tentativa": tentativa,
+                "veredito": veredito,
+                "mudancas_pedidas": mudancas,
+                "sugestoes_nao_bloqueantes": apenas_sugestoes,
+            }
         )
+
+        qualidade = _qualidade_da_tentativa(veredito, mudancas, roteiro)
+        if melhor is None or qualidade < melhor["qualidade"]:
+            melhor = {
+                "qualidade": qualidade,
+                "roteiro": roteiro,
+                "avaliacao": avaliacao,
+                "mudancas": mudancas,
+                "tentativa": tentativa,
+            }
 
         if veredito == "aprovado":
             break
 
         print("  Motivo da reprovação (o que será corrigido na próxima tentativa):")
         print(" ", mudancas)
-    else:
-        print("  Número máximo de tentativas atingido - usando última versão.")
-        print("  Pendências que NÃO foram resolvidas (ajuste manualmente se quiser):")
-        print(" ", mudancas)
 
-    palavras = contar_palavras_narracao(roteiro)
-    if palavras < 1100:
-        print(f"  Roteiro tem só ~{palavras} palavras de narração - rodando passe de expansão...")
-        roteiro_expandido = expandir_roteiro(roteiro, tema, palavras)
-        nova_contagem = contar_palavras_narracao(roteiro_expandido)
-
-        # Trava de segurança: se "expandir" na prática quase dobrou o
-        # tamanho, ou apareceu um divisor solto ("---"), é sinal de que o
-        # modelo continuou a história em vez de desenvolver o que já
-        # existia (já aconteceu - virou uma segunda história inventada
-        # colada na primeira). Se ficou com MENOS palavras que antes, é
-        # sinal de que a resposta foi cortada no meio por limite de token
-        # (já aconteceu também - expansão "piorou" o roteiro). Em
-        # qualquer um desses casos, descarta a expansão e fica com o
-        # roteiro mais curto, mas honesto/completo, em vez do mais longo,
-        # arriscado ou truncado.
-        # Teto ABSOLUTO, não proporção - a expansão dispara com roteiro
-        # abaixo de 1100 palavras, e o alvo é 1270-1620, então crescer
-        # mais de 1.8x é NORMAL vindo de um começo bem curto (ex:
-        # 700->1300 é legítimo). Um teto absoluto bem acima do alvo máximo
-        # (1620) ainda pega duplicação de verdade sem rejeitar expansão
-        # legítima por coincidência de proporção.
-        cresceu_alem_do_razoavel = nova_contagem > 2200
-        ficou_menor = nova_contagem <= palavras
-        tem_divisor_solto = bool(re.search(r"^\s*-{3,}\s*$", roteiro_expandido, re.MULTILINE))
-        if cresceu_alem_do_razoavel or ficou_menor or tem_divisor_solto:
-            if cresceu_alem_do_razoavel:
-                motivo = f"passou de {nova_contagem} palavras (provável duplicação)"
-            elif ficou_menor:
-                motivo = f"ficou com MENOS palavras que antes ({nova_contagem} <= {palavras}, provável corte por limite de token)"
-            else:
-                motivo = "tem divisor '---' solto"
-            print(f"  Aviso: expansão descartada - {motivo}. Mantendo a versão de ~{palavras} palavras.")
+        # TRAVA DE LOOP: se a reprovação é a MESMA de antes, a revisão não
+        # está mexendo no ponto reclamado - insistir com o mesmo pedido só
+        # gasta tentativa (e cota). Na segunda repetição, para e entrega a
+        # melhor versão com a pendência registrada pra revisão manual.
+        assinatura = assinatura_do_pedido(mudancas)
+        if assinatura and assinatura == assinatura_anterior:
+            repeticoes_do_mesmo_pedido += 1
+            print(
+                f"    Aviso: o crítico repetiu exatamente o mesmo pedido "
+                f"({repeticoes_do_mesmo_pedido + 1}ª vez seguida)."
+            )
+            if repeticoes_do_mesmo_pedido >= 2:
+                print(
+                    "    Mesmo pedido pela 3ª vez - o loop não está "
+                    "convergindo. Parando aqui e entregando a melhor "
+                    "versão gerada, com a pendência anotada pra você "
+                    "resolver na mão."
+                )
+                pendencias_manuais = mudancas
+                break
         else:
-            roteiro = roteiro_expandido
-            print(f"  Depois da expansão: ~{nova_contagem} palavras.")
+            repeticoes_do_mesmo_pedido = 0
+        assinatura_anterior = assinatura
+    else:
+        print("  Número máximo de tentativas atingido - usando a melhor versão gerada.")
+        pendencias_manuais = mudancas
+
+    # Entrega a MELHOR tentativa, não a última - uma revisão pode ter
+    # piorado o roteiro e mesmo assim ter sido a última a rodar.
+    if melhor and melhor["roteiro"] is not roteiro:
+        print(
+            f"  Usando o roteiro da tentativa {melhor['tentativa']} "
+            "(melhor avaliação do run)."
+        )
+        roteiro = melhor["roteiro"]
+        avaliacao = melhor["avaliacao"]
+        # As pendências têm que ser as DESSA versão, não as da última
+        # tentativa - senão o relatório manda corrigir um problema que
+        # só existia no roteiro que acabou sendo descartado.
+        pendencias_manuais = melhor["mudancas"]
+
+    if pendencias_manuais and not mudancas_sao_vazias(pendencias_manuais):
+        print("  Pendências que NÃO foram resolvidas (ajuste manualmente se quiser):")
+        print(" ", pendencias_manuais)
+    else:
+        pendencias_manuais = ""
+
+    # Rede de segurança final: se mesmo assim o roteiro escolhido está
+    # curto (ex: a melhor versão veio de uma tentativa anterior), expande.
+    roteiro = aplicar_expansao(roteiro, tema)
+
+    if GERAR_EM_INGLES:
+        print("Traduzindo roteiro (inglês -> português falado natural)...")
+        roteiro_traduzido = traduzir_roteiro_para_ptbr(roteiro)
+        # Checagem de integridade: a tradução tem que preservar a mesma
+        # quantidade de linhas NARRAÇÃO/VISUAL do roteiro em inglês - se
+        # vier bem diferente, o casamento narração<->visual quebrou (o
+        # resto do pipeline depende de 1 VISUAL por NARRAÇÃO). Nesse caso,
+        # melhor manter o roteiro em inglês (com aviso claro) do que
+        # seguir com uma estrutura corrompida sem avisar.
+        narracoes_antes = roteiro.count("NARRAÇÃO:")
+        narracoes_depois = roteiro_traduzido.count("NARRAÇÃO:")
+        if abs(narracoes_depois - narracoes_antes) > 1:
+            print(
+                f"    Aviso: tradução mudou o número de linhas NARRAÇÃO "
+                f"({narracoes_antes} -> {narracoes_depois}) - mantendo o "
+                "roteiro em inglês por segurança. Revise manualmente ou "
+                "rode de novo."
+            )
+        else:
+            roteiro = roteiro_traduzido
+            print(f"  Traduzido: {narracoes_depois} linha(s) de narração.")
+            # A tradução reescreve as frases e pode perder um marcador no
+            # caminho - remarca o que ficou sem, já no texto final.
+            roteiro, remarcados = marcar_verificar_automatico(roteiro)
+            if remarcados:
+                print(f"    {remarcados} número(s) remarcados com [VERIFICAR] após a tradução.")
 
     print("Buscando b-roll correspondente no Pexels...")
     broll = montar_lista_broll(roteiro)
@@ -1569,6 +2961,7 @@ def gerar_video_completo(tema, max_tentativas=4):
         "narracao_limpa": extrair_narracao_limpa(roteiro),
         "avaliacao": avaliacao,
         "historico_revisoes": historico,
+        "pendencias_manuais": pendencias_manuais,
         "broll": broll,
         "metadados": metadados,
         "prompt_imagem_gemini": prompt_imagem,
@@ -1876,12 +3269,15 @@ def gerar_audio_elevenlabs(texto_narracao_limpo, caminho_saida_mp3, pedir_confir
                 # média, quando fala humana natural desce o tom pra
                 # sinalizar fim de pensamento) - baixar stability e subir
                 # style dá mais variação de entonação pro modelo aplicar
-                # essa descida sozinho. Se ainda soar reto, desça mais
-                # stability (até uns 0.3); se ficar instável/errático
-                # demais, suba de novo.
+                # essa descida sozinho. "style" subiu de 0.3 pra 0.4 na
+                # troca pro Flash, tentando compensar um pouco a menor
+                # expressividade que a pesquisa aponta nesse modelo -
+                # não testado ainda, ouça o resultado. Se ainda soar reto,
+                # desça mais stability (até uns 0.3); se ficar instável/
+                # errático demais, desça o style de volta.
                 "stability": 0.35,
                 "similarity_boost": 0.75,
-                "style": 0.3,
+                "style": 0.4,
                 "use_speaker_boost": True,
             },
         }
@@ -1993,6 +3389,18 @@ def montar_relatorio_txt(resultado):
     partes.append("### AVALIAÇÃO DO CRÍTICO (última rodada) ###\n")
     partes.append(resultado["avaliacao"])
 
+    if resultado.get("pendencias_manuais"):
+        partes.append("\n\n" + "=" * 70)
+        partes.append(
+            "### PENDÊNCIAS PRA RESOLVER NA MÃO ###\n"
+            "O loop de revisão parou sem resolver os itens abaixo (ou o "
+            "crítico repetiu o mesmo pedido sem o roteirista conseguir "
+            "atender). O roteiro entregue é a MELHOR versão gerada no run, "
+            "não necessariamente a última - ajuste estes pontos no texto "
+            "antes de gravar:\n"
+        )
+        partes.append(resultado["pendencias_manuais"])
+
     if resultado.get("historico_revisoes"):
         partes.append("\n\n" + "=" * 70)
         partes.append("### HISTÓRICO DE TODAS AS TENTATIVAS (o que foi reprovado) ###\n")
@@ -2000,6 +3408,8 @@ def montar_relatorio_txt(resultado):
             partes.append(f"Tentativa {item['tentativa']}: {item['veredito'].upper()}")
             if item["veredito"] == "reprovado":
                 partes.append(f"  Motivo: {item['mudancas_pedidas']}")
+            for sugestao in item.get("sugestoes_nao_bloqueantes", []):
+                partes.append(f"  Sugestão (não reprovou): {sugestao}")
             partes.append("")
 
     partes.append("\n\n" + "=" * 70)
@@ -2074,15 +3484,6 @@ if __name__ == "__main__":
             carimbo = caminho_escolhido.stem.replace("video_", "")
 
     if resultado is None:
-        if USAR_TEMAS_DE_NOTICIA:
-            print("Buscando temas em alta (notícia)...")
-            temas_noticia = pesquisar_temas_em_alta()
-            print("Temas de notícia encontrados:")
-            for t in temas_noticia:
-                print(" -", t)
-        else:
-            temas_noticia = []
-
         print("Buscando vídeos de maior sucesso dos canais de referência...")
         titulos_referencia = buscar_referencias()
         if titulos_referencia:
@@ -2097,9 +3498,7 @@ if __name__ == "__main__":
                   "pulando o agente de referência.")
             temas_inspirados = []
 
-        # Referência primeiro (padrão comprovado de sucesso no nicho);
-        # notícia só entra se USAR_TEMAS_DE_NOTICIA estiver ligado
-        todos_temas = temas_inspirados + temas_noticia
+        todos_temas = temas_inspirados
         if not todos_temas:
             print(
                 "\nNenhum tema automático disponível - digite o seu tema na "

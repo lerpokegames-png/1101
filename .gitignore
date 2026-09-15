@@ -8,3 +8,6 @@ saidas/
 .pronuncia_dict_cache.json
 __pycache__/
 *.pyc
+
+# Estatísticas de aprendizado (estado local, muda a cada execução)
+.estatisticas_aprendizado.json
