@@ -4305,8 +4305,12 @@ def _erro_amigavel_do_gemini(codigo, texto):
         por_dia = "PerDay" in (texto or "")
         alcance = "do DIA" if por_dia else "por minuto"
         return (f"limite {alcance} da chave atingido. "
-                + ("A cota diária do free tier acabou - só volta amanhã, ou "
-                   "com faturamento ativado. "
+                + ("A cota diária do free tier acabou. Se isso aparece já na "
+                   "PRIMEIRA imagem do dia, é porque o free tier do seu "
+                   "projeto não cobre geração de imagem (medido: a mesma "
+                   "chave gera TEXTO normalmente e recusa TODOS os modelos "
+                   "de imagem com esta cota) - aí só com faturamento "
+                   "ativado, ou use PROVEDOR_IMAGEM = 'pollinations'. "
                    if por_dia else
                    "É passageiro: o pipeline já espera e tenta de novo. ")
                 + f"Resposta: {trecho}")
