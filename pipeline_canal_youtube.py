@@ -1,8 +1,21 @@
 """
-Pipeline de criação de roteiros para YouTube - nicho empresas/administração
-============================================================================
+Pipeline de criação de roteiros para YouTube - multi-nicho
+==========================================================
 
-4 AGENTES:
+NICHOS (qual canal está sendo produzido):
+    Tudo que muda de um canal pro outro - prompts, canais de referência,
+    voz, fonte do visual - fica no dicionário NICHOS, mais abaixo. O canal
+    ativo vem do .env (NICHO=empresas ou NICHO=algoritmo_oculto).
+    - empresas: o nicho original (Elementar/Primo Rico), b-roll do Pexels,
+      thumbnail com a foto do criador. Comportamento idêntico ao de antes.
+    - algoritmo_oculto: documentário forense animado sobre cobranças
+      abusivas de empresas e algoritmos (preço dinâmico, taxa escondida,
+      cartel), com provas de processos reais. Faceless, personagem-guia em
+      boneco, prompt de imagem por cena no lugar do b-roll, Short derivado
+      de cada vídeo, capítulos com tempo e lista de fontes na descrição.
+      Formato copiado do raio-x do canal de referência (raio_x_canal.py).
+
+AGENTES:
 1. Pesquisador  -> busca assuntos em alta (Google News RSS, sem chave de API).
     DESLIGADO por padrão: manchete de jornal quase nunca vira tema bom aqui
     (vem com nome do veículo colado, é notícia do dia, não evergreen). Pra
@@ -19,6 +32,13 @@ Pipeline de criação de roteiros para YouTube - nicho empresas/administração
 7. Narração      -> gera o áudio final via ElevenLabs, com pausas naturais
    entre parágrafos (não é grátis - precisa de ELEVENLABS_API_KEY e
    ELEVENLABS_VOICE_ID no .env; sem isso, só pula essa etapa)
+1C. Fontes      -> (só algoritmo_oculto) busca manchetes reais sobre o tema
+   no Google News e injeta no roteirista e na descrição, pra o
+   "documentário forense" não citar processo que não existe
+8. Short         -> (só algoritmo_oculto) corte vertical de 55-60s escrito a
+   partir do roteiro aprovado, com título e descrição próprios
+9. Cenas         -> (só algoritmo_oculto) um prompt de imagem por linha
+   VISUAL, no estilo fixo do canal, no lugar do b-roll de stock
 
 CUSTO: R$ 0,00 nos agentes 1 a 6 (nuvem Groq ou local Ollama, ambos grátis).
 Busca de b-roll (Pexels) e YouTube Data API são grátis mas sempre usam
@@ -170,22 +190,29 @@ ELEVENLABS_MODEL = "eleven_multilingual_v2"
 # Multilingual v2 - regra de fonema IPA só funciona em turbo_v2/flash_v2,
 # que não usamos aqui (por isso não tem opção de fonema abaixo). Os
 # exemplos são só ponto de partida - ajuste conforme ouvir o resultado.
-REGRAS_PRONUNCIA_ELEVENLABS = {
+REGRAS_PRONUNCIA_BASE = {
     "CEO": "sê é ó",
     "CFO": "sê éfe ó",
     "e-commerce": "i comêrs",
     "cashback": "quéchi béqui",
 }
-CAMINHO_CACHE_DICIONARIO = PASTA_DO_SCRIPT / ".pronuncia_dict_cache.json"
+# Qual canal este run está produzindo - veja a seção NICHOS mais abaixo.
+# Vem do .env (NICHO=empresas ou NICHO=algoritmo_oculto); sem nada no .env,
+# usa o canal novo.
+NICHO_ATIVO = os.getenv("NICHO", "algoritmo_oculto").strip().lower()
 
-# Canais de referência do nicho pra puxar inspiração dos vídeos que mais
-# renderam. Handles confirmados (conferidos por busca, não chutados):
+# Um cache por nicho: o dicionário de pronúncia é diferente em cada canal,
+# e com cache único trocar de canal recriava o dicionário a cada troca.
+CAMINHO_CACHE_DICIONARIO = PASTA_DO_SCRIPT / f".pronuncia_dict_cache_{NICHO_ATIVO}.json"
+
+# Canais de referência do nicho EMPRESAS pra puxar inspiração dos vídeos
+# que mais renderam (os do canal novo estão em NICHOS, mais abaixo). Handles confirmados (conferidos por busca, não chutados):
 # - Elementar: documentário narrativo de empresas/negócios (o mais próximo
 #   do estilo do canal)
 # - primorico: Primo Rico (Thiago Nigro), finanças/investimentos
 # - NerdsdeNegocios: Peter Jordan, maior canal de empreendedorismo do Brasil
 # Use o handle exatamente como aparece na URL do canal (youtube.com/@handle).
-CANAIS_REFERENCIA = ["Elementar", "primorico", "NerdsdeNegocios"]
+CANAIS_REFERENCIA_EMPRESAS = ["Elementar", "primorico", "NerdsdeNegocios"]
 
 # Manchete de Google News quase nunca vira tema bom aqui: vem com nome de
 # jornal colado no fim, é notícia do dia (não evergreen) e concorre com os
@@ -614,6 +641,693 @@ escolher a mais natural, ou reenviar pedindo pra suavizar se saiu exagerado]
 
 
 # =========================================================================
+# PROMPTS DO NICHO "ALGORITMO OCULTO" (documentário forense animado)
+# =========================================================================
+# Formato copiado do raio-x do canal de referência (raio_x_canal.py): pra
+# cada tema, um vídeo longo de ~10 min + um Short de 60s; abertura com
+# contraste de preços; personagem-guia em boneco que toma o golpe; provas
+# de processo/investigação real; "manual de defesa" no fim; descrição com
+# capítulos cronometrados e fontes primárias. Os marcadores que o código
+# parseia (NARRAÇÃO:, VISUAL:, [VERIFICAR], [ARQUIVO REAL], MUDANÇAS
+# OBRIGATÓRIAS:, VEREDITO:, "Nenhuma") são EXATAMENTE os mesmos do nicho
+# de empresas - mudar qualquer um quebra o pipeline em silêncio.
+
+ROTEIRO_PROMPT_OCULTO = """Você é o roteirista de um canal de YouTube de DOCUMENTÁRIO FORENSE ANIMADO
+sobre dinheiro e tecnologia, em português do Brasil. O canal investiga como
+empresas e algoritmos cobram mais do que deveriam - preço dinâmico, taxa
+escondida, comissão fantasma, cartel de preços, monopólio - e mostra as
+PROVAS: processos judiciais, investigações de órgãos reguladores, documentos
+e e-mails internos que vieram a público. Canal faceless: a narração é em voz
+gerada, e a imagem é animação simples com bonecos (estilo "explicado com
+bonequinhos"). Siga as instruções abaixo na ordem exata. Não pule passo.
+
+TEMA: {tema}
+
+MATERIAL DE PESQUISA (manchetes reais encontradas agora sobre o tema - use
+como base factual; o que não estiver aqui e não for de conhecimento amplo
+leva [VERIFICAR]):
+{fontes}
+
+O PERSONAGEM-GUIA: {personagem}
+{personagem} é um boneco, um personagem ILUSTRATIVO e fictício que
+representa o consumidor comum. Ele existe pra dar rosto ao problema: é ele
+que abre o aplicativo e vê o preço dobrar, é ele que recebe a fatura. REGRAS
+DO PERSONAGEM (obrigatórias):
+- Apresente sempre como ilustração ("imagine o {personagem}", "vamos chamar
+  ele de {personagem}"), nunca como pessoa real, nunca como testemunha, fonte
+  ou depoimento ("o {personagem} nos contou" é PROIBIDO).
+- Sem sobrenome, sem cidade, sem profissão, sem idade específica - qualquer
+  detalhe que faça parecer reportagem sobre uma pessoa de verdade.
+- Ele é a ÚNICA pessoa inventada permitida no roteiro inteiro. Qualquer
+  outra pessoa com nome tem que ser figura pública real citada em registro
+  público (executivo, procurador, juiz, pesquisador nomeado no caso) - e o
+  que for atribuído a ela leva [VERIFICAR].
+
+REGRAS DE ENTREGA (muito importantes):
+- Sua resposta final deve conter SOMENTE o roteiro no formato NARRAÇÃO:/
+  VISUAL:, do início ao fim. NÃO escreva saudação, comentário sobre a
+  tarefa, nem frases como "Entendido". NÃO repita os nomes dos passos
+  (PASSO 1, BLOCO A) na resposta - são só guia de raciocínio.
+- NÃO escreva o roteiro duas vezes. Escreva uma única vez e pare.
+- O TEMA precisa virar UM caso concreto: uma empresa real (ou um mecanismo
+  usado por empresas reais nomeadas) e, sempre que existir, o processo,
+  investigação ou multa real ligada a ele. Se o tema for genérico, escolha
+  o caso real mais forte e mais documentado no Passo 1 e use o NOME REAL da
+  empresa em todo o roteiro.
+
+REGRAS FIXAS (valem para o roteiro inteiro):
+- TOM: claro, direto, sem rodeios. Jornalismo forense, não teoria da
+  conspiração. A indignação vem dos FATOS e dos NÚMEROS, nunca de
+  adjetivo ou sussurro. PROIBIDO: "eles não querem que você saiba", "a
+  verdade que escondem de você", "acorde", e qualquer frase que acuse sem
+  apontar a prova na frase seguinte.
+- CADA TERMO TÉCNICO (preço dinâmico, drip pricing, yield management,
+  surge pricing, cartel, colusão algorítmica) é explicado em UMA frase
+  simples na primeira vez que aparece - e depois nunca mais. Varie a forma
+  de explicar; não repita "X, que é Y" toda vez.
+- REGRA DE VERIFICAÇÃO (a mais importante): marque [VERIFICAR] em QUALQUER
+  número específico - valor de multa, percentual, número de processo, data
+  de decisão, quantidade de consumidores, valor de acordo - A MENOS que
+  esteja no MATERIAL DE PESQUISA acima ou seja fato amplamente conhecido.
+  Você não tem como pesquisar: o padrão seguro é marcar. Número de processo
+  e nome de vara/tribunal NUNCA são inventados: se não tem certeza, diga
+  "numa ação civil movida pelo órgão regulador" e marque [VERIFICAR].
+  Um número inventado sobre uma empresa real é o erro mais grave que este
+  roteiro pode ter - mais grave que qualquer problema de ritmo.
+- [ARQUIVO REAL] só aparece sozinho numa linha VISUAL, nunca dentro do
+  texto da NARRAÇÃO. Neste canal, [ARQUIVO REAL] significa: print de
+  manchete, trecho de documento judicial, captura de tela do aplicativo,
+  gráfico oficial - material real que a edição precisa buscar. Exemplo
+  CERTO: "VISUAL: [ARQUIVO REAL] print da manchete sobre a multa". A linha
+  NARRAÇÃO nunca menciona [ARQUIVO REAL].
+- Cada linha NARRAÇÃO leva exatamente UMA linha VISUAL depois dela.
+- FORMATO DO VISUAL neste canal: descreva uma CENA ILUSTRADA simples, com
+  bonecos - quem está na cena, o que faz, e o ÚNICO objeto/tela/número que
+  importa. Comece a linha com "cena ilustrada:". Exemplo: "VISUAL: cena
+  ilustrada: {personagem} olhando o celular, a tela mostra R$ 89 de um lado
+  e R$ 420 do outro". NÃO peça b-roll de banco de vídeo, NÃO descreva
+  pessoas reais (rosto de executivo) - pra isso use [ARQUIVO REAL].
+- PROIBIDO escrever na NARRAÇÃO palavra de instrução deste prompt:
+  "mini-gancho", "bloco", "passo", "personagem-guia" nunca aparecem no
+  texto narrado. ("Manual de defesa" PODE ser dito, faz parte do estilo.)
+- Frases curtas, linguagem falada. PROIBIDO: "mas o que ninguém esperava",
+  "e foi aí que tudo mudou", "só que a história não termina aí", "só que
+  tinha um problema".
+
+PASSO 1 - DEFINA O CASO (escreva antes do roteiro, em até 3 frases):
+Qual empresa real e qual mecanismo de cobrança? Qual processo, investigação
+ou multa real sustenta a história (se souber)? Qual é o contraste de números
+mais forte pra abrir (dois preços pelo mesmo serviço, preço anunciado vs
+preço final, valor cobrado vs valor repassado)?
+
+PASSO 2 - ESCREVA O ROTEIRO NESTA ORDEM E NESTE TAMANHO:
+As faixas abaixo são o MÍNIMO, não a meta. Escreva perto do topo de cada
+faixa - roteiro curto é o erro mais comum.
+
+BLOCO A - A FATURA (3 a 5 frases, 60 a 100 palavras):
+Abra com o contraste concreto de números OU com a cena do {personagem}
+tomando o golpe (o preço que muda na tela, a taxa que aparece no último
+passo). NÃO explique o mecanismo nem cite o processo ainda. Termine com a
+pergunta implícita ("por que o mesmo assento custou cinco vezes mais?").
+
+BLOCO B - COMO A MÁQUINA FUNCIONA (300 a 380 palavras):
+De onde veio esse mecanismo: quem inventou, quando, pra resolver que
+problema - e como ele virou o que é hoje. Explique como se a pessoa nunca
+tivesse ouvido falar. No meio do bloco, UM mini-gancho (dado, ironia ou
+revelação pequena).
+
+BLOCO C - A AUTÓPSIA: AS PROVAS (650 a 850 palavras):
+O caso real, passo a passo: quem investigou, o que os documentos mostraram,
+o que os e-mails internos diziam, como a empresa reagiu, e o que a Justiça
+ou o regulador decidiu (multa, acordo, proibição). Explique o que cada
+prova SIGNIFICA pro bolso de quem paga, não só o fato. O {personagem} pode
+voltar como fio condutor ("na tela do {personagem}, isso aparecia como...").
+Pelo menos TRÊS mini-ganchos, um a cada 200-250 palavras.
+
+BLOCO D - MANUAL DE DEFESA E FECHO (200 a 260 palavras):
+De 3 a 5 regras práticas e ESPECÍFICAS deste mecanismo (não "pesquise antes
+de comprar"), ditas em sequência ("regra um...", "regra dois..."). Depois,
+o fecho: volte à fatura ou à cena do {personagem} da abertura e termine com
+uma frase de impacto - sem moral genérica.
+
+PASSO 3 - FORMATO DE SAÍDA (obrigatório):
+Cada frase ou parágrafo vira uma linha "NARRAÇÃO:" seguida, numa LINHA
+SEPARADA, de uma linha "VISUAL:". Exemplo de formato (não copie o
+conteúdo):
+
+NARRAÇÃO: Duas pessoas, o mesmo voo, o mesmo assento. Uma pagou 89. A outra, 420.
+VISUAL: cena ilustrada: dois bonecos sentados lado a lado no avião, um balão com R$ 89 e outro com R$ 420
+
+NARRAÇÃO: E o motivo não tem nada a ver com combustível.
+VISUAL: cena ilustrada: {personagem} olhando um bilhete de avião com uma interrogação gigante em cima
+
+Repita esse padrão do início ao fim, sem juntar as duas na mesma linha e
+sem títulos de bloco no texto final.
+
+ANTES DE RESPONDER, confira: (1) NARRAÇÃO: e VISUAL: sempre em linhas
+separadas? (2) a empresa aparece com o NOME REAL, e o mecanismo só é
+explicado depois da abertura? (3) [ARQUIVO REAL], quando usado, está SÓ
+na linha VISUAL? (4) tem pelo menos 4 mini-ganchos (1 no bloco B + 3 no
+bloco C) e a palavra "mini-gancho" NÃO aparece na narração? (5) o roteiro
+soma pelo menos 1300 palavras de narração - se não, desenvolva mais o bloco
+C? (6) o manual de defesa tem de 3 a 5 regras específicas? (7) CONTE os
+números específicos: cada um tem [VERIFICAR], exceto os que estão no
+MATERIAL DE PESQUISA ou são fato amplamente conhecido? (8) o {personagem}
+aparece só como ilustração, nunca como testemunha, e é a única pessoa
+inventada? Se alguma resposta for não, corrija antes de entregar.
+"""
+
+AVALIACAO_PROMPT_OCULTO = """Você é um editor crítico de retenção de audiência para YouTube, num canal
+de DOCUMENTÁRIO FORENSE ANIMADO sobre cobranças abusivas de empresas e
+algoritmos (preço dinâmico, taxa escondida, cartel), vídeo longo (não
+Shorts). Avalie o roteiro abaixo seguindo EXATAMENTE o template de resposta
+no final. Preencha cada campo, não pule nenhum. Seja direto.
+
+O personagem-guia do canal se chama {personagem}: é um boneco ilustrativo e
+fictício que representa o consumidor. Ele é PERMITIDO e esperado no roteiro
+- desde que apareça como ilustração e nunca como pessoa real, testemunha ou
+fonte.
+
+ROTEIRO PARA AVALIAR:
+{roteiro}
+
+Antes de preencher o template, confira estes pontos:
+1. A abertura (3-5 primeiras frases) entrega um contraste concreto de
+   números ou a cena do golpe, SEM explicar o mecanismo nem citar o
+   processo ainda? Abertura que começa explicando ("o preço dinâmico é um
+   sistema que...") é fraca.
+2. Cada bloco (como funciona, as provas, manual de defesa) tem pelo menos um
+   dado, revelação ou pergunta nova (mini-gancho)?
+3. Cada termo técnico (preço dinâmico, drip pricing, yield management,
+   surge, cartel, colusão) foi explicado em uma frase simples na primeira
+   vez? Tem termo sem explicação, ou explicação repetida?
+4. O manual de defesa tem de 3 a 5 regras CONCRETAS e específicas deste
+   mecanismo? "Pesquise antes de comprar" ou "fique atento" não conta.
+5. O fecho volta pra abertura (a fatura, a cena do {personagem}) ou é
+   genérico ("e essa é a lição que fica")?
+6. VISUAIS: cada linha VISUAL é (a) uma cena ilustrada simples - quem, o
+   que faz, um objeto/tela/número - ou (b) [ARQUIVO REAL] pra print de
+   manchete, documento ou tela de aplicativo? Problema: VISUAL vago ("cena
+   de tensão", "imagem simbólica"), pedido de rosto de pessoa real sem
+   [ARQUIVO REAL], ou pedido de b-roll de banco de vídeo ("b-roll genérico
+   de escritório") - este canal não usa b-roll de stock.
+7. A palavra "mini-gancho" (ou "bloco", "passo", "personagem-guia") aparece
+   ESCRITA em alguma linha NARRAÇÃO? Sempre erro. ("Manual de defesa" pode.)
+8. CONTE os números específicos, linha por linha, o roteiro INTEIRO - valor
+   de multa, percentual, número de processo, data de decisão, quantidade de
+   pessoas, valor de acordo. Cada um tem [VERIFICAR] OU é fato amplamente
+   conhecido? Liste TODOS os que não tiverem. Número de processo ou nome de
+   tribunal sem [VERIFICAR] é SEMPRE problema grave. Três ou mais números
+   sem marcação = problema GRAVE, pior que qualquer questão de ritmo.
+9. Tem PESSOA COM NOME PRÓPRIO que não seja (a) o {personagem} ou (b)
+   figura pública real citada em registro público? Nomear outra pessoa
+   comum e colocar fala nela é invenção - problema grave. E o {personagem}
+   está sendo tratado como pessoa real ("o {personagem}, morador de...",
+   "o {personagem} nos contou")? Também é problema.
+10. TOM: tem trecho de acusação sem prova na frase seguinte, ou frase de
+    conspiração vazia ("eles não querem que você saiba")? A indignação tem
+    que vir de fato e número.
+
+TEMPLATE DE RESPOSTA (preencha exatamente assim):
+
+NOTA DO GANCHO (0 a 10): [número]
+MOTIVO: [1-2 frases]
+
+PONTOS DE QUEDA: [liste cada um, no formato "Bloco X: [motivo]". Se não
+encontrar nenhum, escreva "Nenhum encontrado".]
+
+MINI-GANCHOS FALTANDO: [em qual bloco falta, ou "Todos os blocos têm
+mini-gancho"]
+
+TERMOS SEM EXPLICAÇÃO: [cite o termo e o trecho, ou "Nenhum encontrado"]
+
+MANUAL DE DEFESA: [quantas regras, e se são específicas - 1 frase]
+
+FECHO: [específico ou genérico - justifique em 1 frase]
+
+VISUAIS PROBLEMÁTICOS: [cite a linha VISUAL: problemática, ou "Nenhum
+encontrado"]
+
+RÓTULO DE INSTRUÇÃO VAZADO: [cite a linha, ou "Nenhum encontrado"]
+
+NÚMEROS SEM VERIFICAR: [liste TODOS os números específicos sem [VERIFICAR]
+que não sejam fato amplamente conhecido - o roteiro inteiro. Ou "Nenhum
+encontrado"]
+
+PESSOA INVENTADA: [cite nome e trecho, ou "Nenhuma encontrada"]
+
+TOM DE CONSPIRAÇÃO: [cite o trecho, ou "Nenhum encontrado"]
+
+CHANCE DE RETENÇÃO: [baixa / média / alta]
+
+MUDANÇAS OBRIGATÓRIAS: [lista objetiva do que mudar, só o essencial - se
+houver qualquer item em "RÓTULO DE INSTRUÇÃO VAZADO", "NÚMEROS SEM
+VERIFICAR", "PESSOA INVENTADA" ou "TOM DE CONSPIRAÇÃO", ele SEMPRE entra
+aqui como obrigatório. Se não houver nada obrigatório, escreva "Nenhuma"]
+
+VEREDITO: [escreva exatamente a palavra APROVADO se não houver nenhuma
+mudança obrigatória, ou exatamente a palavra REPROVADO se houver pelo menos
+uma. Só essa palavra nesta linha, em maiúsculas.]
+"""
+
+METADADOS_PROMPT_OCULTO = """Você é especialista em metadados de YouTube (título, thumbnail, capítulos,
+descrição, tags) para um canal de DOCUMENTÁRIO FORENSE ANIMADO sobre
+cobranças abusivas de empresas e algoritmos, em português do Brasil. O
+canal se chama "{nome_canal}". É faceless: a thumbnail NÃO tem foto de
+pessoa - é um desenho simples com boneco (o personagem {personagem}), um
+objeto ou tela, e um número gigante. Sua função é gerar o que atrai o
+CLIQUE e o que faz o YouTube entender o vídeo, não o conteúdo em si.
+
+TEMA: {tema}
+
+ROTEIRO APROVADO (use só para saber os fatos e o ângulo - não repita o
+roteiro na resposta):
+{roteiro}
+
+FONTES ENCONTRADAS NA PESQUISA (use SÓ estas na lista de fontes da
+descrição; se a lista estiver vazia, escreva uma única linha "• Fontes
+citadas no vídeo - confira antes de publicar"):
+{fontes}
+
+SOBRE CLICKBAIT: curiosidade forte, gap de informação e tensão são o
+trabalho do título e da thumbnail. O que é proibido é PROMETER o que o
+roteiro não entrega, e usar no título um número que no roteiro está
+marcado [VERIFICAR]. A régua é entrega, não intensidade.
+
+Preencha exatamente este template, sem pular campo. O texto entre
+parênteses em cada linha de título é instrução da abordagem - NÃO o inclua
+na resposta, escreva SOMENTE o título.
+
+TÍTULOS (5 opções, cada uma com abordagem diferente, máximo 70 caracteres):
+1. (contraste de números, ex: "De R$ 80 a R$ 165: a armadilha das taxas fantasma da Ticketmaster")
+2. (pergunta direta ao espectador, ex: "Por que a Uber te cobra mais quando a bateria está acabando?")
+3. (a armadilha / o truque, ex: "O truque sujo do algoritmo do Airbnb, revelado")
+4. (autoridade e documentos, ex: "Documentos da FTC revelam o algoritmo que inflou seu carrinho")
+5. (qualquer abordagem acima, terminando com o sufixo " ({nome_canal})")
+
+THUMBNAIL DETALHADA (descreva pra um ilustrador que nunca viu o vídeo -
+desenho simples, boneco, sem foto, sem rosto de pessoa real):
+- CENA DA THUMBNAIL: [o que o boneco {personagem} está fazendo e com que
+  postura simples (mãos na cabeça, apontando pra tela, carteira vazia),
+  qual o objeto ou tela ao lado dele, e onde fica o espaço vazio pro texto]
+- NÚMERO EM DESTAQUE: [o número ou contraste que vai gigante na imagem, ex:
+  "R$ 89 vs R$ 420", ou "nenhum"]
+- TEXTO NA THUMBNAIL: [2 a 4 palavras, a frase exata]
+- POSIÇÃO DO TEXTO: [ex: terço superior esquerdo, sem cobrir o boneco]
+- CORES: [fundo claro ou escuro, uma cor de destaque só pro número/objeto,
+  cite os tons]
+- ELEMENTO GRÁFICO EXTRA: [opcional - seta, círculo vermelho, cifrão
+  rasgado; só se ajudar]
+- REFERÊNCIA DE ESTILO: [ex: "explicador animado com bonequinhos, traço
+  grosso preto, fundo creme, um vermelho só"]
+
+CAPÍTULOS (de 8 a 12, na ordem do roteiro. Cada linha tem o título curto
+do capítulo, depois dois traços verticais ||, depois as 4 PRIMEIRAS
+PALAVRAS EXATAS da linha NARRAÇÃO onde o capítulo começa - copie do
+roteiro, letra por letra, sem [VERIFICAR]. O primeiro capítulo começa na
+primeira linha NARRAÇÃO do roteiro. Uma linha por capítulo, neste formato:)
+- [título do capítulo] || [quatro primeiras palavras exatas]
+
+DESCRIÇÃO DO VÍDEO (siga esta estrutura; 150 a 220 palavras sem contar
+capítulos e fontes; as 2 primeiras frases têm que funcionar sozinhas como
+gancho. Escreva a linha [CAPÍTULOS AQUI] literalmente, com colchetes - o
+programa troca pelos tempos):
+[1º parágrafo: "Você achava que ... Mas ..." - o contraste e a virada]
+[2º parágrafo: "Neste documentário forense, ..." - o que o vídeo revela: o
+mecanismo, o caso, a decisão]
+
+⏱️ CAPÍTULOS:
+[CAPÍTULOS AQUI]
+
+📌 FONTES PRIMÁRIAS:
+[uma linha por fonte, começando com "• ", só com as fontes da lista acima]
+
+⚖️ Aviso: conteúdo educativo e jornalístico baseado em registros públicos e
+processos judiciais. Não é aconselhamento financeiro ou jurídico.
+
+[hashtags: 6 a 8, ex: #Economia #Finanças #{nome_canal_hashtag} + 3 a 5 do
+tema]
+
+TAGS (12 a 18 tags separadas por vírgula: comece com as tags fixas do canal
+"economia explicada, documentário animado, fraudes corporativas,
+investigação forense, educação financeira, finanças pessoais, preço
+dinâmico" e complete com tags específicas deste tema - nome da empresa,
+nome do mecanismo, nome do órgão/processo):
+[lista de tags]
+"""
+
+REFERENCIA_PROMPT_OCULTO = """Você analisa títulos de vídeos de MAIOR SUCESSO (mais visualizações) de
+canais de referência sobre cobranças abusivas, algoritmos de preço, taxas
+escondidas e cartéis - documentário forense baseado em processo judicial,
+investigação de órgão regulador ou multa real. Entenda o padrão do que
+funciona e gere temas NOVOS seguindo esse padrão.
+
+TÍTULOS DE MAIOR SUCESSO DOS CANAIS DE REFERÊNCIA:
+{titulos_referencia}
+
+PASSO 1 - ANÁLISE (escreva em até 4 frases):
+Qual padrão aparece nesses títulos? Considere: tipo de empresa (aplicativo
+do dia a dia, aérea, ingressos, aluguel, varejo), tipo de golpe (preço que
+muda, taxa no último passo, comissão fantasma, cartel), e o gatilho de
+curiosidade (contraste de dois preços, pergunta "por que te cobram mais",
+autoridade "documentos revelam").
+
+PASSO 2 - GERAÇÃO DE TEMAS:
+Gere 6 temas NOVOS de casos REAIS e DOCUMENTADOS - com processo, multa,
+investigação ou decisão pública por trás (no Brasil: Procon, Senacon, CADE,
+Ministério Público, Justiça; fora: FTC, DOJ, Comissão Europeia, CMA).
+Misture casos brasileiros e internacionais que afetam o consumidor
+brasileiro. NÃO repita tema que já esteja na lista acima. Se não tiver
+certeza de que o caso existe, NÃO o inclua - prefira um caso famoso a um
+caso inventado.
+
+REGRA DE FORMATO IMPORTANTE: cada tema é uma descrição NEUTRA e curta do
+assunto (empresa + mecanismo + o caso real) - NÃO é o título chamativo do
+vídeo. Clickbait, letra maiúscula, ponto de exclamação e texto entre
+parênteses são proibidos aqui. NÃO coloque aspas em volta do tema. NÃO
+adicione explicação depois do tema na mesma linha. Sempre em português.
+
+Exemplo de formato CERTO (uma linha, sem aspas, sem explicação depois):
+O algoritmo de aluguel da RealPage e o processo do Departamento de Justiça dos EUA
+
+Exemplo de formato ERRADO (não faça isso de jeito nenhum):
+"O GOLPE DOS ALUGUÉIS!!" - conflito: cartel, gatilho: número
+
+Preencha exatamente este formato:
+
+ANÁLISE: [sua análise do padrão]
+
+TEMAS SUGERIDOS (só o tema em cada linha, sem aspas, sem explicação):
+1. [tema]
+2. [tema]
+3. [tema]
+4. [tema]
+5. [tema]
+6. [tema]
+"""
+
+PROMPT_IMAGEM_PROMPT_OCULTO = """Você escreve prompts de GERAÇÃO de imagem por IA (Gemini, Ideogram, Flux,
+Midjourney - qualquer um) pra thumbnail de um canal de documentário animado
+com bonecos. Outro agente já decidiu a cena; sua função é transformar em um
+prompt que gere uma imagem consistente com o estilo do canal.
+
+CENA DECIDIDA PELO AGENTE ANTERIOR:
+{descricao_foto}
+
+ESTILO FIXO DO CANAL (tem que estar em todo prompt):
+{estilo_visual}
+Personagem {personagem}: {personagem_visual}
+
+Regras:
+- Escreva o prompt em INGLÊS (os geradores respondem melhor), em 1 parágrafo
+  corrido, começando pela cena e terminando pelo bloco de estilo.
+- Descreva a expressão do boneco por POSTURA e traços simples (mãos na
+  cabeça, ombros caídos, olhos arregalados em dois pontos), não por emoção
+  abstrata.
+- Deixe um terço da imagem VAZIO (diga onde) pra entrar o texto depois.
+- NÃO peça texto, letras, número ou logo dentro da imagem: número e texto
+  são adicionados na edição, com fonte e contraste controlados. Se a cena
+  pede "R$ 89 vs R$ 420", peça duas etiquetas de preço em branco.
+- Proporção 16:9. Sem foto, sem realismo, sem 3D, sem rosto de pessoa real.
+
+Preencha este template:
+
+PROMPT PARA GERAR A THUMBNAIL:
+[texto pronto pra colar, em inglês, 1 parágrafo]
+
+DICA DE USO: [1 frase - ex: gerar 4 variações, escolher a de composição mais
+limpa, e adicionar o número e o texto no editor por cima]
+"""
+
+SHORT_PROMPT_OCULTO = """Você transforma o roteiro aprovado de um vídeo longo num SHORT vertical de
+55 a 60 segundos pro mesmo canal ("{nome_canal}", documentário forense
+animado sobre cobranças abusivas). O Short é a isca: entrega o contraste e
+o mecanismo em resumo, e manda pro vídeo completo.
+
+TEMA: {tema}
+
+ROTEIRO LONGO APROVADO (fonte única dos fatos - não adicione nada que não
+esteja nele; mantenha os [VERIFICAR] que existirem nos números que usar):
+{roteiro}
+
+ESTRUTURA DO SHORT (130 a 150 palavras de narração no total - conte):
+1. GANCHO (1-2 frases): o contraste de números ou a pergunta direta. Sem
+   introdução, sem "você sabia".
+2. O MECANISMO (3-4 frases): como a cobrança funciona, com o nome do
+   mecanismo explicado em meia frase.
+3. A PROVA MAIS FORTE (1-2 frases): o processo, a multa ou o documento que
+   mostra que é real.
+4. CHAMADA (1 frase): "O documentário completo, com os documentos, está no
+   vídeo relacionado" (ou variação natural).
+
+REGRAS:
+- Mesmo tom do canal: claro, direto, sem rodeios. Frases curtas.
+- O personagem {personagem} pode aparecer, como ilustração.
+- Mesmo formato do roteiro longo: cada frase numa linha NARRAÇÃO:, seguida
+  numa LINHA SEPARADA por uma linha VISUAL: com uma cena ilustrada
+  vertical simples (9:16 - um boneco, uma tela, um número).
+- PROIBIDO inventar fato novo que não está no roteiro longo.
+
+Responda EXATAMENTE neste formato, nesta ordem, sem comentário:
+
+TÍTULO DO SHORT: [máximo 60 caracteres, pode ter 1 ou 2 emojis, termina com #shorts]
+
+NARRAÇÃO: [frase]
+VISUAL: cena ilustrada: [cena vertical]
+(repita NARRAÇÃO/VISUAL até o fim)
+
+DESCRIÇÃO DO SHORT: [2 a 3 frases: a pergunta do gancho + o que o Short
+revela em 60 segundos + "Assista ao documentário completo no vídeo
+relacionado". Depois, numa linha, 6 a 8 hashtags começando com #Shorts]
+"""
+
+CENAS_PROMPT_OCULTO = """Você transforma as marcações visuais de um roteiro em PROMPTS DE GERAÇÃO DE
+IMAGEM (Gemini, Ideogram, Flux, Midjourney) pra um canal de documentário
+animado com bonecos. Cada prompt gera UM quadro que a edição anima com
+movimento leve (zoom/deslize) por cima da narração.
+
+ESTILO FIXO DO CANAL (entra no fim de TODO prompt, sempre igual):
+{estilo_visual}
+
+PERSONAGEM FIXO ({personagem}): {personagem_visual}
+Sempre que a cena tiver o {personagem}, descreva-o exatamente assim, pra
+ele ficar igual em todos os quadros.
+
+CENAS (número, a marcação VISUAL, e o trecho narrado pra contexto):
+{cenas}
+
+REGRAS:
+- Responda com UMA linha por cena, no formato "N. prompt", com o MESMO
+  número da cena de entrada, todas as cenas, na mesma ordem. Nada além
+  disso: sem título, sem comentário, sem linha em branco entre elas.
+- Prompt em INGLÊS, 1 frase longa: quem está na cena, o que faz (postura,
+  gesto), o único objeto/tela que importa, enquadramento (16:9), e o bloco
+  de estilo no fim.
+- NUNCA peça texto, letras, números ou logo dentro da imagem: onde a cena
+  mostra um preço, peça uma etiqueta ou tela EM BRANCO com destaque na cor
+  de acento - o número é colocado na edição.
+- Se a marcação tiver [ARQUIVO REAL], NÃO gere prompt: escreva
+  "N. [ARQUIVO REAL] " seguido, em português, do que a edição precisa
+  buscar (print de manchete, trecho do documento, tela do aplicativo).
+"""
+
+
+# =========================================================================
+# NICHOS - tudo que muda de um canal pro outro fica aqui
+# =========================================================================
+# Trocar de canal é trocar NICHO no .env. O código dos agentes é o mesmo;
+# o que cada nicho define:
+#   prompts ................ roteirista, crítico, metadados, referência, imagem
+#   canais_referencia ...... handles que o agente 1B analisa
+#   queries_noticia ........ buscas do Google News (só se USAR_TEMAS_DE_NOTICIA)
+#   tema_emergencia ........ tema usado quando nenhum agente sugere nada
+#   usar_fontes ............ agente 1C: manchetes reais injetadas no roteiro
+#   usar_pexels ............ b-roll de stock (empresas) ou não (oculto)
+#   gerar_prompts_de_cena .. agente 9: prompt de imagem por linha VISUAL
+#   gerar_short ............ agente 8: Short derivado do roteiro aprovado
+#   gerar_capitulos ........ tempos de capítulo pela contagem de palavras
+#   marcador_thumbnail ..... campo que o extrator de thumbnail procura
+#   voz .................... voice_settings do ElevenLabs
+#   regras_pronuncia ....... aliases de pronúncia SOMADOS à lista base
+#   personagem / estilo .... só o nicho oculto usa
+#   expansao_* ............. texto do passe de expansão (nomes dos blocos)
+
+NICHOS = {
+    "empresas": {
+        "nome": "Empresas e administração (Elementar / Primo Rico / Nerds de Negócios)",
+        "roteiro_prompt": ROTEIRO_PROMPT,
+        "avaliacao_prompt": AVALIACAO_PROMPT,
+        "metadados_prompt": METADADOS_PROMPT,
+        "referencia_prompt": REFERENCIA_PROMPT,
+        "prompt_imagem_prompt": PROMPT_IMAGEM_PROMPT,
+        "short_prompt": "",
+        "cenas_prompt": "",
+        "marcador_thumbnail": "FOTO DO CRIADOR",
+        "rotulo_prompt_imagem": "PROMPT PRA EDITAR SUA FOTO NO GEMINI",
+        "canais_referencia": CANAIS_REFERENCIA_EMPRESAS,
+        "queries_noticia": [
+            "empresa crise decisão",
+            "empresa faliu escândalo",
+            "ascensão queda empresa",
+            "estratégia empresarial polêmica",
+            "empresa processo bilionário",
+            "fundador empresa erro",
+        ],
+        "tema_emergencia": "Como a BYD ficou tão grande",
+        "usar_fontes": False,
+        "usar_pexels": True,
+        "gerar_prompts_de_cena": False,
+        "gerar_short": False,
+        "gerar_capitulos": False,
+        # Último recurso quando nem o termo traduzido nem as versões mais
+        # curtas acham vídeo: melhor um clipe genérico de ambiente
+        # corporativo do que o trecho ficar sem nenhuma imagem pra editar.
+        "termo_broll_generico": "business office",
+        "regras_pronuncia": {},
+        # Ajustado com base em análise real do áudio: o tom ficava quase
+        # reto no fim de frase (só ~2% de queda de pitch em média, quando
+        # fala humana natural desce o tom pra sinalizar fim de pensamento)
+        # - baixar stability e subir style dá mais variação de entonação
+        # pro modelo aplicar essa descida sozinho. Se ainda soar reto,
+        # desça mais stability (até uns 0.3); se ficar instável/errático
+        # demais, suba de novo.
+        "voz": {
+            "stability": 0.35,
+            "similarity_boost": 0.75,
+            "style": 0.3,
+            "use_speaker_boost": True,
+        },
+        "personagem": "",
+        "personagem_visual": "",
+        "estilo_visual": "",
+        "nome_canal": "",
+        "expansao_foco": (
+            "o MIOLO (a parte com a decisão/conflito central) - adicione mais "
+            "detalhe do raciocínio de gestão e do contexto de cada etapa QUE JÁ "
+            "FOI CITADA"
+        ),
+        "expansao_blocos": "backstory, miolo, conclusão",
+    },
+    "algoritmo_oculto": {
+        "nome": "Documentário forense animado: cobranças abusivas de empresas e algoritmos (PT-BR)",
+        "roteiro_prompt": ROTEIRO_PROMPT_OCULTO,
+        "avaliacao_prompt": AVALIACAO_PROMPT_OCULTO,
+        "metadados_prompt": METADADOS_PROMPT_OCULTO,
+        "referencia_prompt": REFERENCIA_PROMPT_OCULTO,
+        "prompt_imagem_prompt": PROMPT_IMAGEM_PROMPT_OCULTO,
+        "short_prompt": SHORT_PROMPT_OCULTO,
+        "cenas_prompt": CENAS_PROMPT_OCULTO,
+        "marcador_thumbnail": "CENA DA THUMBNAIL",
+        "rotulo_prompt_imagem": "PROMPT PRA GERAR A THUMBNAIL (sem foto, boneco)",
+        # O próprio canal de referência - 12 vídeos até agora; o agente 1B
+        # pega os mais vistos e gera temas no mesmo padrão. Acrescente
+        # aqui outros canais desse formato conforme for achando.
+        "canais_referencia": ["ELALGORITMOOCULTO-95"],
+        "queries_noticia": [
+            "preço dinâmico cobrança abusiva",
+            "taxa escondida consumidor processo",
+            "cartel de preços multa CADE",
+            "algoritmo de preço investigação",
+            "Procon multa aplicativo cobrança",
+            "tarifa oculta Justiça condena",
+        ],
+        "tema_emergencia": "Por que o mesmo assento de avião custa cinco vezes mais pra quem compra depois",
+        "usar_fontes": True,
+        "usar_pexels": False,
+        "gerar_prompts_de_cena": True,
+        "gerar_short": True,
+        "gerar_capitulos": True,
+        "termo_broll_generico": "smartphone payment screen",
+        # Marcas e termos em inglês que o Multilingual v2 lê "à portuguesa"
+        # se não tiver alias. Só regra de troca de texto funciona nesse
+        # modelo (veja REGRAS_PRONUNCIA_BASE).
+        "regras_pronuncia": {
+            "Uber": "úber",
+            "Airbnb": "érbiênbi",
+            "Ticketmaster": "tíquet máster",
+            "RealPage": "ríal pêidj",
+            "FTC": "éfe tê cê",
+            "DOJ": "dí ou djêi",
+            "yield management": "íld mânagement",
+            "drip pricing": "drip práicing",
+            "surge pricing": "sârdge práicing",
+        },
+        # Narração "clara, direta, sem rodeios" (descrição do canal de
+        # referência): mais estável e menos teatral que a voz de negócios.
+        # Ponto de partida - ouça o primeiro áudio e ajuste: se soar reto,
+        # desça stability pra 0.4; se soar dramático, desça style pra 0.1.
+        "voz": {
+            "stability": 0.45,
+            "similarity_boost": 0.8,
+            "style": 0.15,
+            "use_speaker_boost": True,
+        },
+        # Personagem-guia (o "Toño" do canal de referência). Nome curto,
+        # de uma sílaba ou duas, que soe bem repetido 15 vezes num vídeo.
+        "personagem": "Zé",
+        # Descrição fixa em inglês que entra em TODO prompt de imagem - é o
+        # que faz o boneco sair parecido de um quadro pro outro.
+        "personagem_visual": (
+            "a simple stick-figure man with a round head, dot eyes, a blue cap "
+            "and a white t-shirt, always drawn the same way"
+        ),
+        "estilo_visual": (
+            "flat 2D vector explainer illustration, simple stick-figure "
+            "characters with round heads and dot eyes, thick black outlines, "
+            "minimal props, clean cream background, a single red accent color "
+            "on the one object or price tag that matters, no text, no letters, "
+            "no numbers, no logos, 16:9"
+        ),
+        # Troque pelo nome do SEU canal - entra no sufixo de título, na
+        # hashtag da descrição e no prompt do Short.
+        "nome_canal": "O Algoritmo Oculto",
+        "expansao_foco": (
+            "o BLOCO DAS PROVAS (a investigação, os documentos e a decisão) - "
+            "explique melhor o que cada prova JÁ CITADA significa pro bolso de "
+            "quem paga, e desenvolva o raciocínio"
+        ),
+        "expansao_blocos": "como a máquina funciona, as provas, manual de defesa",
+    },
+}
+
+if NICHO_ATIVO not in NICHOS:
+    raise SystemExit(
+        f"NICHO='{NICHO_ATIVO}' não existe. Opções: {', '.join(NICHOS)}. "
+        "Ajuste a linha NICHO= no .env."
+    )
+NICHO = NICHOS[NICHO_ATIVO]
+
+# As constantes abaixo são as que o resto do código já usava - só passam
+# a vir do nicho ativo. Nenhuma função precisou mudar por causa disso.
+ROTEIRO_PROMPT = NICHO["roteiro_prompt"]
+AVALIACAO_PROMPT = NICHO["avaliacao_prompt"]
+METADADOS_PROMPT = NICHO["metadados_prompt"]
+REFERENCIA_PROMPT = NICHO["referencia_prompt"]
+PROMPT_IMAGEM_PROMPT = NICHO["prompt_imagem_prompt"]
+SHORT_PROMPT = NICHO["short_prompt"]
+CENAS_PROMPT = NICHO["cenas_prompt"]
+CANAIS_REFERENCIA = NICHO["canais_referencia"]
+TERMO_BROLL_GENERICO = NICHO["termo_broll_generico"]
+REGRAS_PRONUNCIA_ELEVENLABS = {**REGRAS_PRONUNCIA_BASE, **NICHO["regras_pronuncia"]}
+
+
+def _campos_do_nicho():
+    """Campos que os prompts podem usar como {personagem}, {nome_canal}
+    etc. Prompt que não usa um campo simplesmente ignora - str.format
+    aceita chave sobrando, o que não aceita é chave faltando."""
+    nome = NICHO.get("nome_canal", "")
+    hashtag = unicodedata.normalize("NFKD", nome).encode("ascii", "ignore").decode("ascii")
+    hashtag = re.sub(r"[^A-Za-z0-9]+", "", hashtag)
+    return {
+        "personagem": NICHO.get("personagem", ""),
+        "nome_canal": nome,
+        "nome_canal_hashtag": hashtag or "Canal",
+        "estilo_visual": NICHO.get("estilo_visual", ""),
+        "personagem_visual": NICHO.get("personagem_visual", ""),
+    }
+
+
+# =========================================================================
 # FUNÇÃO BASE DE CHAMADA AO LLM
 # =========================================================================
 
@@ -800,14 +1514,7 @@ def pesquisar_temas_em_alta(quantidade=8):
     import feedparser
     from urllib.parse import quote
 
-    queries = [
-        "empresa crise decisão",
-        "empresa faliu escândalo",
-        "ascensão queda empresa",
-        "estratégia empresarial polêmica",
-        "empresa processo bilionário",
-        "fundador empresa erro",
-    ]
+    queries = NICHO["queries_noticia"]
 
     temas = []
     vistos = set()
@@ -985,8 +1692,12 @@ def gerar_temas_por_referencia(titulos_referencia, quantidade=6):
 # AGENTE 2 - ROTEIRISTA
 # =========================================================================
 
-def escrever_roteiro(tema, roteiro_anterior=None, mudancas_obrigatorias=None, historico_mudancas=None):
-    prompt = ROTEIRO_PROMPT.format(tema=tema)
+def escrever_roteiro(tema, roteiro_anterior=None, mudancas_obrigatorias=None, historico_mudancas=None, fontes=None):
+    # fontes/personagem só existem no prompt do nicho oculto; o prompt de
+    # empresas ignora as chaves sobrando (str.format aceita)
+    prompt = ROTEIRO_PROMPT.format(
+        tema=tema, fontes=formatar_fontes_para_prompt(fontes), **_campos_do_nicho()
+    )
     if roteiro_anterior and mudancas_obrigatorias:
         prompt += (
             "\n\nJá existe uma versão anterior deste roteiro, que foi REPROVADA "
@@ -1043,7 +1754,7 @@ def escrever_roteiro(tema, roteiro_anterior=None, mudancas_obrigatorias=None, hi
 # =========================================================================
 
 def avaliar_roteiro(roteiro, mudancas_pedidas_antes=None):
-    prompt = AVALIACAO_PROMPT.format(roteiro=roteiro)
+    prompt = AVALIACAO_PROMPT.format(roteiro=roteiro, **_campos_do_nicho())
     if mudancas_pedidas_antes and not mudancas_sao_vazias(mudancas_pedidas_antes):
         prompt += (
             "\n\nCONTEXTO: na rodada de avaliação ANTERIOR, você (ou outra "
@@ -1112,10 +1823,8 @@ _RUIDO_TERMO_VISUAL = (
     "animação de", "animacao de", "plano de", "close de", "tomada de",
 )
 
-# Último recurso quando nem o termo traduzido nem as versões mais curtas
-# acham vídeo: melhor um clipe genérico de ambiente corporativo do que o
-# trecho ficar sem nenhuma imagem pra editar.
-TERMO_BROLL_GENERICO = "business office"
+# TERMO_BROLL_GENERICO (último recurso da busca de b-roll) vem de NICHOS -
+# "business office" no nicho de empresas, outro termo no canal novo.
 
 
 # Palavras de ligação que não fazem sentido no fim de um termo de busca
@@ -1361,15 +2070,21 @@ def baixar_broll(broll_dict, pasta_destino, por_termo=1):
 # AGENTE 5 - METADADOS (título, thumbnail detalhada, descrição, tags)
 # =========================================================================
 
-def gerar_metadados(tema, roteiro):
-    prompt = METADADOS_PROMPT.format(tema=tema, roteiro=roteiro)
+def gerar_metadados(tema, roteiro, fontes=None):
+    prompt = METADADOS_PROMPT.format(
+        tema=tema, roteiro=roteiro, fontes=formatar_fontes_para_prompt(fontes),
+        **_campos_do_nicho()
+    )
     return chamar_llm(prompt, temperature=0.8, max_tokens=2000)
 
 
 def extrair_descricao_foto(metadados_texto):
-    """Pega o campo 'FOTO DO CRIADOR' de dentro da resposta de metadados."""
+    """Pega o campo da thumbnail de dentro da resposta de metadados - 'FOTO
+    DO CRIADOR' no nicho de empresas, 'CENA DA THUMBNAIL' no canal faceless
+    (o nome do campo vem de NICHOS). O campo termina no próximo bullet
+    '- CAMPO:' em maiúsculas."""
     match = re.search(
-        r"FOTO DO CRIADOR.*?:\s*(.+?)(?:\n- [A-ZÀ-Ú]|\Z)",
+        re.escape(NICHO["marcador_thumbnail"]) + r".*?:\s*(.+?)(?:\n- [A-ZÀ-Ú]|\Z)",
         metadados_texto,
         re.DOTALL,
     )
@@ -1383,7 +2098,7 @@ def extrair_descricao_foto(metadados_texto):
 # =========================================================================
 
 def gerar_prompt_imagem(descricao_foto):
-    prompt = PROMPT_IMAGEM_PROMPT.format(descricao_foto=descricao_foto)
+    prompt = PROMPT_IMAGEM_PROMPT.format(descricao_foto=descricao_foto, **_campos_do_nicho())
     return chamar_llm(prompt, temperature=0.6, max_tokens=800)
 
 
@@ -1430,10 +2145,8 @@ def expandir_roteiro(roteiro, tema, palavras_atuais, alvo_minimo=1270):
         "- PROIBIDO duplicar qualquer trecho do roteiro original. A "
         "  resposta final tem que ter cada fato UMA vez só.\n\n"
         "Nesta ordem de prioridade, dentro dessas regras:\n"
-        "1. Desenvolva mais o MIOLO (a parte com a decisão/conflito "
-        "central) - adicione mais detalhe do raciocínio de gestão e do "
-        "contexto de cada etapa QUE JÁ FOI CITADA, sem trazer fato novo.\n"
-        "2. Garanta que cada bloco (backstory, miolo, conclusão) tenha "
+        f"1. Desenvolva mais {NICHO['expansao_foco']}, sem trazer fato novo.\n"
+        f"2. Garanta que cada bloco ({NICHO['expansao_blocos']}) tenha "
         "pelo menos um mini-gancho (dado novo, revelação pequena, "
         "pergunta) - insira uma frase nova onde faltar, mas só reformulando\n"
         "informação que já está no roteiro.\n"
@@ -1450,11 +2163,314 @@ def expandir_roteiro(roteiro, tema, palavras_atuais, alvo_minimo=1270):
 
 
 # =========================================================================
-# ORQUESTRAÇÃO - roda os 6 agentes em sequência, com loop de correção
+# AGENTE 1C - FONTES (manchetes reais sobre o tema, via RSS do Google News)
+# =========================================================================
+
+def pesquisar_fontes(tema, quantidade=8):
+    """
+    Busca manchetes REAIS sobre o tema pra ancorar o roteiro. O LLM não
+    pesquisa nada sozinho - sem isso, o "documentário forense" cita
+    processo, multa e número de vara que nunca existiram, com toda a
+    confiança do mundo. Manchete de jornal não é o documento judicial em
+    si, mas é o suficiente pra (1) confirmar que o caso existe, (2) dar o
+    nome certo de órgão/empresa/valor e (3) virar a lista de fontes da
+    descrição, com link. Continua valendo a regra: o que não estiver aqui
+    leva [VERIFICAR].
+    """
+    if not tema:
+        return []
+    try:
+        import feedparser
+    except ImportError:
+        print("    Aviso: feedparser não instalado (pip install feedparser) - sem fontes automáticas.")
+        return []
+    from urllib.parse import quote
+
+    buscas = [
+        (tema, "pt-BR", "BR", "BR:pt-419"),
+        (f"{tema} processo OR multa OR investigação", "pt-BR", "BR", "BR:pt-419"),
+        # Os casos mais documentados (FTC, DOJ, Comissão Europeia) saem
+        # primeiro na imprensa em inglês
+        (f"{tema} lawsuit OR fine OR investigation", "en-US", "US", "US:en"),
+    ]
+    fontes, vistos = [], set()
+    for consulta, hl, gl, ceid in buscas:
+        url = (
+            f"https://news.google.com/rss/search?q={quote(consulta)}"
+            f"&hl={hl}&gl={gl}&ceid={ceid}"
+        )
+        try:
+            feed = feedparser.parse(url)
+        except Exception as e:
+            print(f"    Aviso: falha ao buscar fontes ({type(e).__name__}) - seguindo sem.")
+            continue
+        for entry in feed.entries[:4]:
+            titulo = (entry.get("title") or "").strip()
+            if not titulo or titulo in vistos:
+                continue
+            vistos.add(titulo)
+            veiculo = ""
+            origem = entry.get("source")
+            if isinstance(origem, dict):
+                veiculo = origem.get("title", "") or ""
+            fontes.append(
+                {
+                    "titulo": titulo,
+                    "veiculo": veiculo,
+                    "link": entry.get("link", ""),
+                    "data": (entry.get("published") or "")[:16],
+                }
+            )
+        if len(fontes) >= quantidade:
+            break
+    return fontes[:quantidade]
+
+
+def formatar_fontes_para_prompt(fontes):
+    """Lista legível pro LLM (e pro relatório). Vazia -> aviso explícito,
+    pra o roteirista não achar que tem base factual quando não tem."""
+    if not fontes:
+        return (
+            "(nenhuma fonte encontrada automaticamente - trate TODO dado "
+            "específico como não verificado e marque [VERIFICAR])"
+        )
+    linhas = []
+    for f in fontes:
+        veiculo = f" [{f['veiculo']}]" if f.get("veiculo") else ""
+        data = f" ({f['data']})" if f.get("data") else ""
+        linhas.append(f"- {f['titulo']}{veiculo}{data} - {f.get('link', '')}")
+    return "\n".join(linhas)
+
+
+# =========================================================================
+# AGENTE 8 - SHORT (corte vertical de 55-60s derivado do roteiro aprovado)
+# =========================================================================
+
+def _corpo_do_short(texto):
+    """Só a parte NARRAÇÃO:/VISUAL: - corta a descrição, que vem depois e
+    entraria na narração se a regex chegasse até ela."""
+    return texto.split("DESCRIÇÃO DO SHORT:")[0]
+
+
+def gerar_short(tema, roteiro):
+    """
+    O canal de referência publica, pra CADA tema, o vídeo longo e um Short
+    de ~60s com o mesmo gancho - e o Short é o que traz gente (no raio-x:
+    1.041 views no Short contra 10 no longo do mesmo dia). O Short é
+    escrito a partir do roteiro APROVADO, nunca do zero, pra não inventar
+    fato que o crítico não viu. Reaproveita o formato NARRAÇÃO:/VISUAL:
+    pra a narração limpa e os prompts de cena funcionarem igual.
+    """
+    prompt = SHORT_PROMPT.format(tema=tema, roteiro=roteiro, **_campos_do_nicho())
+    texto = chamar_llm(prompt, temperature=0.7, max_tokens=1500)
+    palavras = contar_palavras_narracao(_corpo_do_short(texto))
+    if palavras < 100 or palavras > 175:
+        print(f"    Short saiu com {palavras} palavras (alvo 130-150) - pedindo ajuste...")
+        texto = chamar_llm(
+            prompt
+            + f"\n\nATENÇÃO: sua versão anterior tinha {palavras} palavras de "
+            "narração. Reescreva com 130 a 150 palavras, mesma estrutura, "
+            "mesmo formato.",
+            temperature=0.6,
+            max_tokens=1500,
+        )
+        palavras = contar_palavras_narracao(_corpo_do_short(texto))
+    titulo = re.search(r"TÍTULO DO SHORT:\s*(.+)", texto)
+    descricao = re.search(r"DESCRIÇÃO DO SHORT:\s*(.+)", texto, re.DOTALL)
+    corpo = _corpo_do_short(texto)
+    return {
+        "texto": texto,
+        "titulo": titulo.group(1).strip() if titulo else "",
+        "roteiro": corpo.strip(),
+        "narracao_limpa": extrair_narracao_limpa(corpo),
+        "descricao": descricao.group(1).strip() if descricao else "",
+        "palavras": palavras,
+    }
+
+
+# =========================================================================
+# CAPÍTULOS - tempo estimado de cada capítulo pela contagem de palavras
+# =========================================================================
+
+# Narração PT-BR no ElevenLabs fica perto de 150 palavras por minuto; os
+# <break> entre parágrafos somam ~0,6s cada. É ESTIMATIVA: confira com o
+# áudio final antes de publicar. O YouTube só ativa capítulos se o
+# primeiro for 00:00, houver pelo menos 3, e cada um durar 10s ou mais.
+PALAVRAS_POR_MINUTO_NARRACAO = 150
+PAUSA_ENTRE_PARAGRAFOS_S = 0.6
+
+
+def _normalizar_para_busca(texto):
+    texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("ascii")
+    texto = re.sub(r"[^a-z0-9 ]+", " ", texto.lower())
+    return re.sub(r"\s+", " ", texto).strip()
+
+
+def _segmentos_de_narracao(roteiro):
+    trechos = re.findall(r"NARRAÇÃO:\s*(.+?)(?=NARRAÇÃO:|VISUAL:|\Z)", roteiro, re.DOTALL)
+    limpos = []
+    for t in trechos:
+        t = re.sub(r"\[ARQUIVO REAL\]|\[VERIFICAR\]", "", t)
+        t = re.sub(r"\s{2,}", " ", t).strip()
+        if t:
+            limpos.append(t)
+    return limpos
+
+
+def montar_capitulos(metadados_texto, roteiro):
+    """
+    O agente de metadados devolve linhas "Título || quatro primeiras
+    palavras da NARRAÇÃO onde começa". Aqui o programa acha essa linha no
+    roteiro e calcula o tempo pela contagem de palavras até ali - o LLM não
+    sabe contar tempo, mas sabe copiar quatro palavras.
+    Devolve (capitulos, titulos_nao_encontrados).
+    """
+    segmentos = _segmentos_de_narracao(roteiro)
+    inicio_s = []
+    t = 0.0
+    for seg in segmentos:
+        inicio_s.append(t)
+        t += len(seg.split()) / PALAVRAS_POR_MINUTO_NARRACAO * 60 + PAUSA_ENTRE_PARAGRAFOS_S
+
+    pedidos = re.findall(r"^\s*-\s*(.+?)\s*\|\|\s*(.+?)\s*$", metadados_texto, re.MULTILINE)
+    capitulos, nao_encontrados = [], []
+    indice = 0
+    for titulo, trecho in pedidos:
+        titulo = titulo.strip("[] ").strip()
+        palavras = _normalizar_para_busca(trecho.strip("[] ")).split()
+        achado = None
+        # Tenta com as 4 palavras; se o modelo errou uma, com 3, depois 2.
+        # Só procura DEPOIS do capítulo anterior - capítulo não volta no tempo.
+        for tentativa in (" ".join(palavras[:4]), " ".join(palavras[:3]), " ".join(palavras[:2])):
+            if not tentativa:
+                continue
+            for j in range(indice, len(segmentos)):
+                if tentativa in _normalizar_para_busca(segmentos[j]):
+                    achado = j
+                    break
+            if achado is not None:
+                break
+        if achado is None:
+            nao_encontrados.append(titulo)
+            continue
+        indice = achado
+        capitulos.append({"segundos": inicio_s[achado], "titulo": titulo})
+
+    if capitulos:
+        capitulos[0]["segundos"] = 0.0
+    # Regra do YouTube: 10s por capítulo - descarta o que ficou colado no anterior
+    filtrados = []
+    for c in capitulos:
+        if filtrados and c["segundos"] - filtrados[-1]["segundos"] < 10:
+            continue
+        filtrados.append(c)
+    for c in filtrados:
+        s = int(round(c["segundos"]))
+        c["tempo"] = f"{s // 60:02d}:{s % 60:02d}"
+    return filtrados, nao_encontrados
+
+
+def inserir_capitulos(metadados_texto, capitulos):
+    """Troca a linha [CAPÍTULOS AQUI] da descrição pela lista com tempos.
+    Se o modelo não escreveu o marcador, anexa a lista no fim."""
+    if not capitulos:
+        return metadados_texto
+    bloco = "\n".join(f"{c['tempo']} {c['titulo']}" for c in capitulos)
+    if "[CAPÍTULOS AQUI]" in metadados_texto:
+        return metadados_texto.replace("[CAPÍTULOS AQUI]", bloco)
+    return metadados_texto + "\n\nCAPÍTULOS COM TEMPO (cole na descrição):\n" + bloco
+
+
+# =========================================================================
+# AGENTE 9 - CENAS (prompt de imagem por trecho, no lugar do b-roll de stock)
+# =========================================================================
+
+def _pares_narracao_visual(roteiro):
+    return re.findall(r"NARRAÇÃO:\s*(.+?)\s*\n\s*VISUAL:[ \t]*([^\n]+)", roteiro, re.DOTALL)
+
+
+def gerar_prompts_de_cena(roteiro, lote=20):
+    """
+    Banco de vídeo não entrega "boneco olhando o celular com dois preços".
+    Este agente pega cada linha VISUAL do roteiro e devolve um prompt de
+    geração de imagem no estilo fixo do canal (estilo e personagem vêm de
+    NICHOS, pra os quadros saírem parecidos entre si). Vai em lotes de 20
+    porque um roteiro tem 40-70 cenas e a resposta inteira não cabe numa
+    chamada só com folga.
+    """
+    pares = _pares_narracao_visual(roteiro)
+    if not pares:
+        return []
+    cenas = []
+    for inicio in range(0, len(pares), lote):
+        bloco = pares[inicio : inicio + lote]
+        linhas = []
+        for k, (narracao, visual) in enumerate(bloco, start=inicio + 1):
+            resumo = re.sub(r"\s+", " ", narracao)[:140]
+            linhas.append(f"{k}. VISUAL: {visual.strip()}  (narração: {resumo})")
+        prompt = CENAS_PROMPT.format(cenas="\n".join(linhas), **_campos_do_nicho())
+        resposta = chamar_llm(prompt, temperature=0.5, max_tokens=6000)
+        respondidos = {}
+        for m in re.finditer(r"^\s*(\d+)[.)]\s*(.+?)\s*$", resposta, re.MULTILINE):
+            respondidos[int(m.group(1))] = m.group(2)
+        for k, (narracao, visual) in enumerate(bloco, start=inicio + 1):
+            arquivo_real = "ARQUIVO REAL" in visual.upper()
+            texto = respondidos.get(k)
+            if not texto:
+                # Modelo pulou a cena: cai num prompt cru com a marcação
+                # original - melhor que deixar o trecho sem imagem.
+                texto = (
+                    "[ARQUIVO REAL] " + visual.strip()
+                    if arquivo_real
+                    else f"{visual.strip()}. {NICHO['estilo_visual']}"
+                )
+            cenas.append(
+                {
+                    "n": k,
+                    "narracao": re.sub(r"\s+", " ", narracao).strip(),
+                    "visual": visual.strip(),
+                    "prompt": texto.strip(),
+                    "arquivo_real": arquivo_real or texto.upper().startswith("[ARQUIVO REAL]"),
+                }
+            )
+        print(f"    Cenas {inicio + 1}-{inicio + len(bloco)} de {len(pares)} prontas.")
+    return cenas
+
+
+def montar_arquivo_cenas(resultado):
+    """Arquivo de trabalho da edição: um prompt por cena, na ordem do vídeo,
+    com o trecho narrado do lado pra saber o que está sendo ilustrado."""
+    cenas = resultado.get("cenas") or []
+    L = ["=" * 70, f"CENAS PARA GERAR - {resultado['tema']}", "=" * 70, ""]
+    L.append("FOLHA DE PERSONAGEM (gere primeiro, uma vez, e use como referência):")
+    L.append(
+        f"  Character sheet, front view and three-quarter view of "
+        f"{NICHO['personagem_visual']}. {NICHO['estilo_visual']}"
+    )
+    L.append("")
+    L.append("ESTILO FIXO (já está no fim de cada prompt abaixo):")
+    L.append(f"  {NICHO['estilo_visual']}")
+    L.append("")
+    L.append(
+        f"Total: {len(cenas)} cena(s). As marcadas BUSCAR são [ARQUIVO REAL]: "
+        "não é pra gerar, é material real (print, documento, tela) que a "
+        "edição precisa achar."
+    )
+    L.append("")
+    for c in cenas:
+        L.append("-" * 70)
+        L.append(f"CENA {c['n']:02d}  |  narração: {c['narracao'][:160]}")
+        L.append(f"  marcação: {c['visual']}")
+        L.append(f"  {'BUSCAR' if c['arquivo_real'] else 'PROMPT'}: {c['prompt']}")
+    return "\n".join(L)
+
+
+# =========================================================================
+# ORQUESTRAÇÃO - roda os agentes em sequência, com loop de correção
 # =========================================================================
 
 
-def gerar_video_completo(tema, max_tentativas=4):
+def gerar_video_completo(tema, max_tentativas=4, fontes=None):
     mudancas = None
     roteiro = None
     avaliacao = None
@@ -1470,6 +2486,7 @@ def gerar_video_completo(tema, max_tentativas=4):
             roteiro_anterior=roteiro,
             mudancas_obrigatorias=mudancas,
             historico_mudancas=historico_mudancas,
+            fontes=fontes,
         )
 
         # Validação: já aconteceu de o roteirista devolver algo vazio ou
@@ -1484,7 +2501,7 @@ def gerar_video_completo(tema, max_tentativas=4):
                 f"(só {roteiro.count('NARRAÇÃO:')} linha(s) NARRAÇÃO:) - "
                 "gerando de novo antes de avaliar..."
             )
-            roteiro = escrever_roteiro(tema, roteiro_anterior=None, mudancas_obrigatorias=None)
+            roteiro = escrever_roteiro(tema, roteiro_anterior=None, mudancas_obrigatorias=None, fontes=fontes)
             if roteiro.count("NARRAÇÃO:") < 3:
                 print("    Aviso: segunda tentativa também veio inválida - avaliando mesmo assim.")
 
@@ -1553,17 +2570,43 @@ def gerar_video_completo(tema, max_tentativas=4):
             roteiro = roteiro_expandido
             print(f"  Depois da expansão: ~{nova_contagem} palavras.")
 
-    print("Buscando b-roll correspondente no Pexels...")
-    broll = montar_lista_broll(roteiro)
+    if NICHO["usar_pexels"]:
+        print("Buscando b-roll correspondente no Pexels...")
+        broll = montar_lista_broll(roteiro)
+    else:
+        print("  (este nicho não usa b-roll de stock - o visual sai dos prompts de cena)")
+        broll = {}
 
     print("Gerando título, thumbnail, descrição e tags...")
-    metadados = gerar_metadados(tema, roteiro)
+    metadados = gerar_metadados(tema, roteiro, fontes=fontes)
 
-    print("Gerando prompt de edição de foto para o Gemini...")
+    capitulos, capitulos_perdidos = [], []
+    if NICHO["gerar_capitulos"]:
+        capitulos, capitulos_perdidos = montar_capitulos(metadados, roteiro)
+        metadados = inserir_capitulos(metadados, capitulos)
+        if capitulos_perdidos:
+            print(
+                f"    Aviso: {len(capitulos_perdidos)} capítulo(s) não localizado(s) "
+                "no roteiro: " + "; ".join(capitulos_perdidos)
+            )
+
+    print("Gerando prompt de imagem da thumbnail...")
     descricao_foto = extrair_descricao_foto(metadados)
     prompt_imagem = gerar_prompt_imagem(descricao_foto)
 
+    cenas = []
+    if NICHO["gerar_prompts_de_cena"]:
+        print("Gerando prompts de imagem por cena...")
+        cenas = gerar_prompts_de_cena(roteiro)
+
+    short = None
+    if NICHO["gerar_short"]:
+        print("Escrevendo o Short derivado do roteiro...")
+        short = gerar_short(tema, roteiro)
+        print(f"    Short: {short['palavras']} palavras - {short['titulo']}")
+
     return {
+        "nicho": NICHO_ATIVO,
         "tema": tema,
         "roteiro": roteiro,
         "narracao_limpa": extrair_narracao_limpa(roteiro),
@@ -1572,6 +2615,11 @@ def gerar_video_completo(tema, max_tentativas=4):
         "broll": broll,
         "metadados": metadados,
         "prompt_imagem_gemini": prompt_imagem,
+        "fontes": fontes or [],
+        "capitulos": capitulos,
+        "capitulos_nao_localizados": capitulos_perdidos,
+        "cenas": cenas,
+        "short": short,
     }
 
 
@@ -1679,7 +2727,7 @@ def garantir_dicionario_pronuncia():
     resp = requests.post(
         "https://api.elevenlabs.io/v1/pronunciation-dictionaries/add-from-rules",
         headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
-        json={"rules": regras, "name": "Dicionario canal empresas"},
+        json={"rules": regras, "name": f"Dicionario canal {NICHO_ATIVO}"},
     )
     if resp.status_code != 200:
         if resp.status_code in (401, 403):
@@ -1870,20 +2918,10 @@ def gerar_audio_elevenlabs(texto_narracao_limpo, caminho_saida_mp3, pedir_confir
             # misturada (cashback, e-commerce) - evita o normalizador
             # aplicar regra errada por achar que o texto é outro idioma
             "language_code": "pt",
-            "voice_settings": {
-                # Ajustado com base em análise real do áudio: o tom ficava
-                # quase reto no fim de frase (só ~2% de queda de pitch em
-                # média, quando fala humana natural desce o tom pra
-                # sinalizar fim de pensamento) - baixar stability e subir
-                # style dá mais variação de entonação pro modelo aplicar
-                # essa descida sozinho. Se ainda soar reto, desça mais
-                # stability (até uns 0.3); se ficar instável/errático
-                # demais, suba de novo.
-                "stability": 0.35,
-                "similarity_boost": 0.75,
-                "style": 0.3,
-                "use_speaker_boost": True,
-            },
+            # Os valores ficam em NICHOS[...]["voz"]: narração de negócios e
+            # narração de documentário forense pedem entonação diferente
+            # (o porquê de cada valor está comentado lá).
+            "voice_settings": NICHO["voz"],
         }
         if dicionario:
             corpo["pronunciation_dictionary_locators"] = [
@@ -2007,20 +3045,58 @@ def montar_relatorio_txt(resultado):
     partes.append(resultado["metadados"])
 
     partes.append("\n\n" + "=" * 70)
-    partes.append("### PROMPT PRA EDITAR SUA FOTO NO GEMINI ###\n")
+    partes.append(f"### {NICHO['rotulo_prompt_imagem']} ###\n")
     partes.append(resultado["prompt_imagem_gemini"])
 
-    partes.append("\n\n" + "=" * 70)
-    partes.append("### B-ROLL ENCONTRADO POR TRECHO ###\n")
-    for termo, dados in resultado["broll"].items():
-        partes.append(f"- {termo}")
-        if isinstance(dados, dict) and dados.get("tipo") == "arquivo_real_necessario":
-            partes.append("  (precisa de foto/vídeo real de arquivo, não de banco de stock)")
-        elif dados:
-            for item in dados:
-                partes.append(f"  {item['preview']}")
-        else:
-            partes.append("  (nenhum resultado encontrado)")
+    if resultado.get("fontes"):
+        partes.append("\n\n" + "=" * 70)
+        partes.append("### FONTES ENCONTRADAS (manchetes reais - confira antes de publicar) ###\n")
+        partes.append(formatar_fontes_para_prompt(resultado["fontes"]))
+
+    if resultado.get("capitulos"):
+        partes.append("\n\n" + "=" * 70)
+        partes.append(
+            "### CAPÍTULOS (tempo ESTIMADO por contagem de palavras - confira "
+            "com o áudio final) ###\n"
+        )
+        for c in resultado["capitulos"]:
+            partes.append(f"{c['tempo']} {c['titulo']}")
+        if len(resultado["capitulos"]) < 3:
+            partes.append("(o YouTube só ativa capítulos com 3 ou mais - complete na mão)")
+        if resultado.get("capitulos_nao_localizados"):
+            partes.append(
+                "Não localizados no roteiro: "
+                + "; ".join(resultado["capitulos_nao_localizados"])
+            )
+
+    if resultado.get("short"):
+        curto = resultado["short"]
+        partes.append("\n\n" + "=" * 70)
+        partes.append(f"### SHORT ({curto.get('palavras', '?')} palavras de narração) ###\n")
+        partes.append(f"TÍTULO: {curto.get('titulo', '')}\n")
+        partes.append("ROTEIRO DO SHORT (com marcações):\n" + curto.get("roteiro", ""))
+        partes.append("\nNARRAÇÃO LIMPA DO SHORT:\n" + curto.get("narracao_limpa", ""))
+        partes.append("\nDESCRIÇÃO DO SHORT:\n" + curto.get("descricao", ""))
+
+    if resultado.get("cenas"):
+        partes.append("\n\n" + "=" * 70)
+        partes.append(
+            f"### CENAS: {len(resultado['cenas'])} prompt(s) de imagem - estão no "
+            "arquivo _cenas.txt ao lado deste ###"
+        )
+
+    if resultado.get("broll"):
+        partes.append("\n\n" + "=" * 70)
+        partes.append("### B-ROLL ENCONTRADO POR TRECHO ###\n")
+        for termo, dados in resultado["broll"].items():
+            partes.append(f"- {termo}")
+            if isinstance(dados, dict) and dados.get("tipo") == "arquivo_real_necessario":
+                partes.append("  (precisa de foto/vídeo real de arquivo, não de banco de stock)")
+            elif dados:
+                for item in dados:
+                    partes.append(f"  {item['preview']}")
+            else:
+                partes.append("  (nenhum resultado encontrado)")
 
     return "\n".join(partes)
 
@@ -2028,6 +3104,9 @@ def montar_relatorio_txt(resultado):
 if __name__ == "__main__":
     pasta_saidas = PASTA_DO_SCRIPT / "saidas"
     pasta_saidas.mkdir(exist_ok=True)
+
+    print(f"Nicho ativo: {NICHO_ATIVO} - {NICHO['nome']}")
+    print("(pra trocar de canal, mude a linha NICHO= no .env)\n")
 
     modo = input(
         "1 - Gerar vídeo novo do zero\n"
@@ -2106,7 +3185,7 @@ if __name__ == "__main__":
                 "pergunta abaixo (ou configure a YOUTUBE_API_KEY no .env pra "
                 "voltar a receber sugestões dos canais de referência)."
             )
-            todos_temas = ["Como a BYD ficou tão grande"]
+            todos_temas = [NICHO["tema_emergencia"]]
 
         print("\nTodos os temas candidatos:")
         for i, t in enumerate(todos_temas, 1):
@@ -2126,7 +3205,19 @@ if __name__ == "__main__":
 
         print(f"\nUsando tema: {tema_escolhido}\n")
 
-        resultado = gerar_video_completo(tema_escolhido)
+        fontes = []
+        if NICHO["usar_fontes"]:
+            print("Buscando manchetes reais sobre o tema (Google News)...")
+            fontes = pesquisar_fontes(tema_escolhido)
+            if fontes:
+                print(f"  {len(fontes)} fonte(s) encontrada(s):")
+                for f_ in fontes:
+                    print(f"   - {f_['titulo']}")
+            else:
+                print("  Nenhuma fonte encontrada - o roteiro vai marcar tudo com [VERIFICAR].")
+            print()
+
+        resultado = gerar_video_completo(tema_escolhido, fontes=fontes)
         carimbo = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # Salva numa pasta "saidas" ao lado do script (não depende de onde o
@@ -2141,19 +3232,40 @@ if __name__ == "__main__":
     with open(caminho_txt, "w", encoding="utf-8") as f:
         f.write(montar_relatorio_txt(resultado))
 
+    caminho_cenas = None
+    if resultado.get("cenas"):
+        caminho_cenas = pasta_saidas / f"video_{carimbo}_cenas.txt"
+        with open(caminho_cenas, "w", encoding="utf-8") as f:
+            f.write(montar_arquivo_cenas(resultado))
+
     print("Gerando áudio da narração (ElevenLabs)...")
     caminho_mp3 = pasta_saidas / f"video_{carimbo}.mp3"
     audio_gerado = gerar_audio_elevenlabs(resultado["narracao_limpa"], caminho_mp3)
 
-    print("Baixando clipes de b-roll...")
+    # O Short tem narração própria (130-150 palavras, ~1/10 do custo do
+    # longo). A função já pergunta antes de gastar crédito.
+    audio_short = None
+    curto = resultado.get("short")
+    if curto and curto.get("narracao_limpa"):
+        print("Gerando áudio do Short (ElevenLabs)...")
+        caminho_short_mp3 = pasta_saidas / f"video_{carimbo}_short.mp3"
+        audio_short = gerar_audio_elevenlabs(curto["narracao_limpa"], caminho_short_mp3)
+
+    baixados, pulados = [], []
     pasta_broll = pasta_saidas / f"video_{carimbo}_broll"
-    baixados, pulados = baixar_broll(resultado["broll"], pasta_broll)
+    if resultado.get("broll"):
+        print("Baixando clipes de b-roll...")
+        baixados, pulados = baixar_broll(resultado["broll"], pasta_broll)
 
     print("\nConcluído!")
     print(f"  Texto legível (abra no Bloco de Notas): {caminho_txt}")
     print(f"  Dados completos (JSON):                 {caminho_json}")
     if audio_gerado:
         print(f"  Áudio da narração:                      {audio_gerado}")
+    if audio_short:
+        print(f"  Áudio do Short:                         {audio_short}")
+    if caminho_cenas:
+        print(f"  Prompts de imagem por cena:             {caminho_cenas}")
     if baixados:
         print(f"  Clipes de b-roll ({len(baixados)}):{' ' * 14}         {pasta_broll}")
     if pulados:

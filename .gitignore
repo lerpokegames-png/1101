@@ -5,6 +5,6 @@
 saidas/
 
 # Cache local
-.pronuncia_dict_cache.json
+.pronuncia_dict_cache*.json
 __pycache__/
 *.pyc
